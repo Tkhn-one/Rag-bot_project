@@ -1,0 +1,53 @@
+# --- Секреты и локальные настройки ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+.codex/
+.vscode/
+.idea/
+*.user
+
+# --- Каталоги сборки (C++) ---
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.dll
+*.so
+*.dylib
+compile_commands.json
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Данные и рантайм ---
+data/tmp/
+data/cache/
+uploads/
+db/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# --- ОС и редакторы ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
