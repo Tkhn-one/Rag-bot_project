@@ -216,15 +216,19 @@ bool run(std::string_view test, const std::filesystem::path& demo,
                expect(probe.calls() == 0, "no evidence must skip generation");
     }
     if (test == "unknown_citation") {
-        ProbeProvider unknown({999, "Срок приёмки результата составляет десять рабочих дней."});
+        const auto documentId = store.documents().front().id();
+        ProbeProvider unknown({999, std::string(contractQuote), documentId});
         RagService service(store, retriever, unknown);
         return expect(isError(service.ask("срок приёмки"), AppError::InvalidCitation) &&
                           unknown.calls() == 1,
                       "a citation with an unknown line must be rejected");
     }
     if (test == "altered_quote") {
-        return expect(isError(withProbe.ask("срок приёмки"), AppError::InvalidCitation) &&
-                          probe.calls() == 1,
+        const auto documentId = store.documents().front().id();
+        ProbeProvider altered({demoLine, "Выдуманная цитата.", documentId});
+        RagService service(store, retriever, altered);
+        return expect(isError(service.ask("срок приёмки"), AppError::InvalidCitation) &&
+                          altered.calls() == 1,
                       "an altered quotation must be rejected");
     }
     return expect(false, "unknown test");
