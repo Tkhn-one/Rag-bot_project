@@ -11,22 +11,26 @@ public:
 
 class InMemoryKnowledgeStore final : public IKnowledgeStore {
 public:
-    void replace(IndexedDocument document) override {
-        document_ = std::move(document);
+    void append(IndexedDocument document) override {
+        documents_.push_back(std::move(document));
     }
 
-    const IndexedDocument* current() const noexcept override {
-        return document_ ? &*document_ : nullptr;
+    std::span<const IndexedDocument> documents() const noexcept override {
+        return documents_;
+    }
+
+    const IndexedDocument* current() const noexcept {
+        return documents_.empty() ? nullptr : &documents_.back();
     }
 
 private:
-    std::optional<IndexedDocument> document_;
+    std::vector<IndexedDocument> documents_;
 };
 
 class KeywordRetriever final : public IRetriever {
 public:
     std::vector<Chunk> retrieve(const Question& question,
-                                std::span<const Chunk> chunks) const override;
+                                std::span<const IndexedDocument> documents) const override;
 };
 
 class MockProvider final : public ILlmProvider {
@@ -36,7 +40,8 @@ public:
         if (evidence.empty()) {
             return AppError::InvalidCitation;
         }
-        return ProposedCitation{evidence.front().line(), evidence.front().text()};
+        const auto& chunk = evidence.front();
+        return ProposedCitation{chunk.line(), chunk.text(), chunk.documentId()};
     }
 };
 

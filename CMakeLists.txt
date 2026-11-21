@@ -34,9 +34,16 @@ if(BUILD_TESTING)
     add_executable(rag_tests tests/prototype_tests.cpp)
     target_link_libraries(rag_tests PRIVATE rag_infrastructure)
     foreach(case IN ITEMS answer empty_file empty_question no_match
-                          unknown_citation altered_quote missing_file encodings)
+                          unknown_citation altered_quote missing_file encodings second_document
+                          duplicate_import failed_import_preserves_library wrong_document_citation)
         add_test(NAME ${case}
                  COMMAND rag_tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}/data/demo/contract.txt"
                          "${CMAKE_CURRENT_BINARY_DIR}")
     endforeach()
+    add_test(NAME cli_multiple_txt
+             COMMAND rag_cli "${CMAKE_CURRENT_SOURCE_DIR}/data/demo/contract.txt"
+                             "${CMAKE_CURRENT_SOURCE_DIR}/data/demo/decisions.txt"
+                             "Резервное копирование")
+    set_tests_properties(cli_multiple_txt PROPERTIES
+        PASS_REGULAR_EXPRESSION "decisions[.]txt, строка 4 [(]ID документа 2[)]")
 endif()

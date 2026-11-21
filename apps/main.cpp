@@ -7,8 +7,10 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include <filesystem>
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 namespace {
 
@@ -33,13 +35,13 @@ void print(DWORD handleId, std::ostream& stream, const std::string& utf8) {
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
-    if (argc != 3) {
+    if (argc < 3) {
         print(STD_ERROR_HANDLE, std::cerr,
-              "Использование: rag_cli <файл.txt> \"<вопрос>\"\n");
+              "Использование: rag_cli <файл.txt> [<ещё-файл.txt> ...] \"<вопрос>\"\n");
         return 2;
     }
 
-    const auto question = rag::encodeUtf8(argv[2]);
+    const auto question = rag::encodeUtf8(argv[argc - 1]);
     if (!question) {
         print(STD_ERROR_HANDLE, std::cerr, "Не удалось прочитать вопрос.\n");
         return 2;
@@ -52,9 +54,10 @@ int wmain(int argc, wchar_t* argv[]) {
     rag::IndexingService index(reader, store);
     rag::RagService service(store, retriever, provider);
 
+    const std::vector<std::filesystem::path> files(argv + 1, argv + argc - 1);
     std::ostringstream output;
     std::ostringstream errors;
-    const auto status = rag::runCli(index, service, argv[1], *question, output, errors);
+    const auto status = rag::runCli(index, service, files, *question, output, errors);
     print(STD_OUTPUT_HANDLE, std::cout, output.str());
     print(STD_ERROR_HANDLE, std::cerr, errors.str());
     return status;

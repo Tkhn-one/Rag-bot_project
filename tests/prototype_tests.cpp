@@ -69,6 +69,40 @@ bool encodings(const std::filesystem::path& buildDir) {
            expect(isError(reader.read(path), AppError::InvalidEncoding), "malformed UTF-8 accepted");
 }
 
+constexpr std::size_t demoLine = 4;
+constexpr std::string_view contractQuote =
+    "Срок приёмки результата составляет десять рабочих дней.";
+constexpr std::string_view decisionsQuote =
+    "Резервное копирование выполняется каждую пятницу.";
+
+bool cites(const Result<Answer>& result, DocumentId id, std::string_view source,
+           std::string_view quote) {
+    const auto* answer = std::get_if<Answer>(&result);
+    return answer && answer->citation() && answer->citation()->documentId() == id &&
+           answer->citation()->source() == source && answer->citation()->line() == demoLine &&
+           answer->citation()->quote() == quote;
+}
+
+bool duplicateImport(IndexingService& index, const InMemoryKnowledgeStore& store,
+                     const std::filesystem::path& demo, const std::filesystem::path& buildDir) {
+    const auto copy = buildDir / "duplicate_import.txt";
+    const auto& first = store.documents().front();
+    const auto id = first.id();
+    const auto chunks = first.chunks().size();
+    if (!expect(writeFixture(copy, "\xEF\xBB\xBF" + first.content()),
+                "could not write a copy of the original text")) {
+        return false;
+    }
+
+    return expect(index.import(demo) == Result<std::size_t>(chunks) &&
+                      index.import(copy) == Result<std::size_t>(chunks),
+                  "reimporting known content must succeed") &&
+           expect(store.documents().size() == 1 && store.documents().front().id() == id &&
+                      store.documents().front().source() == "contract.txt" &&
+                      store.documents().front().policy() == DocumentPolicy::LocalOnly,
+                  "duplicates must preserve the original document identity, name and policy");
+}
+
 bool run(std::string_view test, const std::filesystem::path& demo,
          const std::filesystem::path& buildDir) {
     if (test == "encodings") {
@@ -104,6 +138,58 @@ bool run(std::string_view test, const std::filesystem::path& demo,
     if (!expect(std::holds_alternative<std::size_t>(index.import(demo)),
                 "the demo contract must import successfully")) {
         return false;
+    }
+
+    if (test == "duplicate_import") {
+        return duplicateImport(index, store, demo, buildDir);
+    }
+    if (test == "second_document" || test == "wrong_document_citation" ||
+        test == "failed_import_preserves_library") {
+        const auto firstId = store.documents().front().id();
+        if (test == "failed_import_preserves_library") {
+            const auto path = buildDir / "failed_import.txt";
+            if (!expect(writeFixture(path, "Valid first line.\r\n\xC3\x28"),
+                        "could not write malformed TXT") ||
+                !expect(isError(index.import(path), AppError::InvalidEncoding) &&
+                            store.documents().size() == 1 && store.documents().front().id() == firstId,
+                        "failed import must leave the original library intact")) {
+                return false;
+            }
+        }
+
+        const auto second = demo.parent_path() / "decisions.txt";
+        if (!expect(std::holds_alternative<std::size_t>(index.import(second)) &&
+                        store.documents().size() == 2,
+                    "the library must contain both successful imports")) {
+            return false;
+        }
+        const auto& secondDocument = store.documents().back();
+        const auto secondId = secondDocument.id();
+        if (test == "wrong_document_citation") {
+            for (const auto& proposal : {
+                     ProposedCitation{demoLine, std::string(decisionsQuote), firstId},
+                     ProposedCitation{999, std::string(decisionsQuote), secondId},
+                     ProposedCitation{demoLine, "Выдуманная цитата.", secondId}}) {
+                ProbeProvider invalid(proposal);
+                RagService service(store, retriever, invalid);
+                if (!expect(isError(service.ask("Резервное копирование"), AppError::InvalidCitation) &&
+                                invalid.calls() == 1,
+                            "validation must check document ID, line and quote against evidence")) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        MockProvider mock;
+        RagService service(store, retriever, mock);
+        return expect(firstId != secondId && secondDocument.policy() == DocumentPolicy::LocalOnly,
+                      "the second document needs its own ID and the default policy") &&
+               expect(cites(service.ask("срок приёмки"), firstId, "contract.txt", contractQuote),
+                      "the original line 4 must remain searchable") &&
+               expect(cites(service.ask("Резервное копирование"), secondId,
+                            "decisions.txt", decisionsQuote),
+                      "the second document must supply its own line 4");
     }
 
     if (test == "answer") {

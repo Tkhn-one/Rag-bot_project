@@ -21,16 +21,21 @@ enum class AppError {
 template <typename T>
 using Result = std::variant<T, AppError>;
 
+using DocumentId = std::size_t;
+
+enum class DocumentPolicy { LocalOnly, AllowRemote };
+
 class Chunk {
 public:
-    Chunk(std::size_t line, std::string text)
-        : line_(line), text_(std::move(text)) {}
+    Chunk(DocumentId documentId, std::size_t line, std::string text)
+        : documentId_(documentId), line_(line), text_(std::move(text)) {}
 
-    // Within one imported document, the line number also identifies the chunk.
+    DocumentId documentId() const noexcept { return documentId_; }
     std::size_t line() const noexcept { return line_; }
     const std::string& text() const noexcept { return text_; }
 
 private:
+    DocumentId documentId_;
     std::size_t line_;
     std::string text_;
 };
@@ -59,6 +64,7 @@ public:
         : source_(std::move(source)), chunk_(std::move(chunk)) {}
 
     const std::string& source() const noexcept { return source_; }
+    DocumentId documentId() const noexcept { return chunk_.documentId(); }
     std::size_t line() const noexcept { return chunk_.line(); }
     const std::string& quote() const noexcept { return chunk_.text(); }
 

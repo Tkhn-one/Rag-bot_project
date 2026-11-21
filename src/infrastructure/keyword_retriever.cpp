@@ -45,7 +45,7 @@ std::unordered_set<std::wstring> words(std::string_view text) {
 }  // namespace
 
 std::vector<Chunk> KeywordRetriever::retrieve(const Question& question,
-                                               std::span<const Chunk> chunks) const {
+                                               std::span<const IndexedDocument> documents) const {
     const auto terms = words(question.text());
     if (terms.empty()) {
         return {};
@@ -53,17 +53,19 @@ std::vector<Chunk> KeywordRetriever::retrieve(const Question& question,
 
     const Chunk* best = nullptr;
     std::size_t bestScore = 0;
-    for (const auto& chunk : chunks) {
-        const auto candidates = words(chunk.text());
-        std::size_t score = 0;
-        for (const auto& term : terms) {
-            if (candidates.contains(term)) {
-                ++score;
+    for (const auto& document : documents) {
+        for (const auto& chunk : document.chunks()) {
+            const auto candidates = words(chunk.text());
+            std::size_t score = 0;
+            for (const auto& term : terms) {
+                if (candidates.contains(term)) {
+                    ++score;
+                }
             }
-        }
-        if (score > bestScore) {
-            best = &chunk;
-            bestScore = score;
+            if (score > bestScore) {
+                best = &chunk;
+                bestScore = score;
+            }
         }
     }
 

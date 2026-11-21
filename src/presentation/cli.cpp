@@ -29,14 +29,22 @@ std::string_view describe(AppError error) {
 
 }  // namespace
 
-int runCli(IndexingService& index, RagService& rag, const std::filesystem::path& file,
+int runCli(IndexingService& index, RagService& rag, std::span<const std::filesystem::path> files,
            std::string question, std::ostream& output, std::ostream& errors) {
-    const auto imported = index.import(file);
-    if (const auto* error = std::get_if<AppError>(&imported)) {
-        errors << describe(*error) << '\n';
+    std::size_t failedImports = 0;
+    for (const auto& file : files) {
+        const auto imported = index.import(file);
+        if (const auto* error = std::get_if<AppError>(&imported)) {
+            const auto path = file.u8string();
+            errors << std::string(path.begin(), path.end()) << ": " << describe(*error) << '\n';
+            ++failedImports;
+        }
+    }
+    if (failedImports == files.size()) {
         return 1;
     }
 
+    const int status = failedImports == 0 ? 0 : 1;
     const auto result = rag.ask(std::move(question));
     if (const auto* error = std::get_if<AppError>(&result)) {
         errors << describe(*error) << '\n';
@@ -45,14 +53,15 @@ int runCli(IndexingService& index, RagService& rag, const std::filesystem::path&
 
     const auto& citation = std::get<Answer>(result).citation();
     if (!citation) {
-        output << "В документе не найдено подтверждения по словам вопроса.\n";
-        return 0;
+        output << "В библиотеке не найдено подтверждения по словам вопроса.\n";
+        return status;
     }
 
     output << "Найденный фрагмент (тестовый провайдер)\n"
            << "«" << citation->quote() << "»\n"
-           << "Источник: " << citation->source() << ", строка " << citation->line() << '\n';
-    return 0;
+           << "Источник: " << citation->source() << ", строка " << citation->line()
+           << " (ID документа " << citation->documentId() << ")\n";
+    return status;
 }
 
 }  // namespace rag
