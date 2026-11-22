@@ -1,8 +1,6 @@
 #include "rag/infrastructure/adapters.hpp"
 #include "rag/infrastructure/utf8.hpp"
-
-#include <algorithm>
-#include <fstream>
+#include "local_file.hpp"
 
 namespace rag {
 namespace {
@@ -40,45 +38,22 @@ std::optional<std::string> decodeTxt(std::string bytes) {
 
 }  // namespace
 
-Result<std::string> TxtReader::read(const std::filesystem::path& path) const {
-    auto extension = path.extension().wstring();
-    std::ranges::transform(extension, extension.begin(), [](wchar_t letter) {
-        if (letter >= L'A' && letter <= L'Z') {
-            return static_cast<wchar_t>(letter - L'A' + L'a');
-        }
-        return letter;
-    });
-    if (extension != L".txt") {
+Result<std::vector<TextSection>> TxtReader::read(const std::filesystem::path& path) const {
+    if (!hasExtension(path, L".txt")) {
         return AppError::UnsupportedFormat;
     }
 
-    std::error_code statusError;
-    if (!std::filesystem::is_regular_file(path, statusError)) {
-        return AppError::FileUnavailable;
+    auto file = readLocalFile(path, maxFileBytes);
+    if (const auto* error = std::get_if<AppError>(&file)) {
+        return *error;
     }
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return AppError::FileUnavailable;
-    }
-
-    std::string bytes;
-    char buffer[4096];
-    while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
-        const auto count = static_cast<std::size_t>(file.gcount());
-        if (count > maxFileBytes - bytes.size()) {
-            return AppError::FileTooLarge;
-        }
-        bytes.append(buffer, count);
-    }
-    if (file.bad() || !file.eof()) {
-        return AppError::FileUnavailable;
-    }
-
-    auto text = decodeTxt(std::move(bytes));
+    auto text = decodeTxt(std::get<std::string>(std::move(file)));
     if (!text || text->find('\0') != std::string::npos) {
         return AppError::InvalidEncoding;
     }
-    return std::move(*text);
+    std::vector<TextSection> sections;
+    sections.push_back({std::move(*text)});
+    return sections;
 }
 
 }  // namespace rag

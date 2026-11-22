@@ -77,17 +77,33 @@ std::string readFixture(const fs::path& path) {
     return std::string(std::istreambuf_iterator<char>(file), {});
 }
 
-void executeFixtureSql(const fs::path& path, const char* sql) {
+using FixtureConnection = std::unique_ptr<sqlite3, decltype(&sqlite3_close)>;
+
+FixtureConnection fixtureConnection(const fs::path& path, int flags) {
     const auto filename = encodeUtf8(path.native());
     require(filename.has_value(), "could not encode database fixture path");
     sqlite3* raw = nullptr;
-    const auto status = sqlite3_open_v2(filename->c_str(), &raw,
-                                       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
-    const std::unique_ptr<sqlite3, decltype(&sqlite3_close)> connection(raw, sqlite3_close);
+    const auto status = sqlite3_open_v2(filename->c_str(), &raw, flags, nullptr);
+    FixtureConnection connection(raw, sqlite3_close);
     require(status == SQLITE_OK, "could not open database fixture");
-    if (sqlite3_exec(raw, sql, nullptr, nullptr, nullptr) != SQLITE_OK) {
-        throw std::runtime_error(sqlite3_errmsg(raw));
+    return connection;
+}
+
+void executeFixtureSql(const fs::path& path, const char* sql) {
+    const auto connection = fixtureConnection(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+    if (sqlite3_exec(connection.get(), sql, nullptr, nullptr, nullptr) != SQLITE_OK) {
+        throw std::runtime_error(sqlite3_errmsg(connection.get()));
     }
+}
+
+int fixtureScalar(const fs::path& path, const char* sql) {
+    const auto connection = fixtureConnection(path, SQLITE_OPEN_READONLY);
+    sqlite3_stmt* raw = nullptr;
+    const auto prepared = sqlite3_prepare_v2(connection.get(), sql, -1, &raw, nullptr);
+    const std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(raw, sqlite3_finalize);
+    require(prepared == SQLITE_OK && sqlite3_step(statement.get()) == SQLITE_ROW,
+            "could not read scalar from SQLite fixture");
+    return sqlite3_column_int(statement.get(), 0);
 }
 
 std::unique_ptr<SqliteKnowledgeStore> openStore(const fs::path& path) {
@@ -102,7 +118,7 @@ void requireCitation(const IKnowledgeStore& store, std::string question, Documen
     const auto answer = requireValue(service.ask(std::move(question)), "answering from SQLite");
     const auto& citation = answer.citation();
     require(citation && citation->source() == source && citation->documentId() == id &&
-                citation->line() == 4 && citation->quote() == quote,
+                citation->line() == 4 && !citation->page() && citation->quote() == quote,
             "the stored citation's source, ID, line or text changed");
 }
 
@@ -113,7 +129,7 @@ void reopen(const fs::path& directory, const fs::path& demo) {
     const auto path = directory / L"библиотека с пробелами.sqlite";
     const auto decisions = demo / "decisions.txt";
     const TxtReader reader;
-    const auto content = requireValue(reader.read(decisions), "decoding demo TXT");
+    const auto content = requireValue(reader.read(decisions), "decoding demo TXT").front().text;
     DocumentId decisionsId = 0;
     {
         auto store = openStore(path);
@@ -155,7 +171,7 @@ void duplicate(const fs::path& directory, const fs::path& demo) {
         const TxtReader reader;
         auto store = openStore(path);
         IndexingService index(reader, *store);
-        require(requireValue(index.import(copy), "reimporting a renamed TXT with a BOM") == 1,
+        require(requireValue(index.import(copy), "reimporting a renamed TXT with a BOM").chunks == 1,
                 "duplicate import must return the original chunk count");
         requireValue(index.import(demo / "decisions.txt"), "importing different content");
     }
@@ -202,7 +218,7 @@ void rollback(const fs::path& directory, const fs::path& demo) {
 
     executeFixtureSql(path, "DROP TRIGGER fail_second_chunk");
     IndexingService index(reader, *store);
-    require(requireValue(index.import(fixture), "retrying after rollback") == 2,
+    require(requireValue(index.import(fixture), "retrying after rollback").chunks == 2,
             "the retry must publish both chunks");
     const auto afterRetry = requireValue(store->documents(), "reading after retry");
     require(afterRetry.size() == 2 && afterRetry.back().chunks().size() == 2,
@@ -242,6 +258,66 @@ void invalidDatabase(const fs::path& directory) {
     require(readFixture(foreign) == original, "opening an unrelated database must preserve its bytes");
 }
 
+void createLegacyLibrary(const fs::path& path) {
+    executeFixtureSql(path, R"sql(
+        CREATE TABLE documents (
+            id INTEGER PRIMARY KEY, source TEXT NOT NULL,
+            content TEXT NOT NULL COLLATE BINARY UNIQUE,
+            policy INTEGER NOT NULL CHECK (policy IN (0, 1))
+        ) STRICT;
+        CREATE TABLE chunks (
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            line INTEGER NOT NULL CHECK (line > 0), text TEXT NOT NULL,
+            PRIMARY KEY (document_id, line)
+        ) STRICT, WITHOUT ROWID;
+        PRAGMA application_id = 0x52414742;
+        PRAGMA user_version = 1;
+        INSERT INTO documents VALUES
+            (42, 'decisions.txt', char(10, 10, 10) || 'Резервное копирование выполняется каждую пятницу.', 1);
+        INSERT INTO chunks VALUES (42, 4, 'Резервное копирование выполняется каждую пятницу.');
+    )sql");
+}
+
+void migrate(const fs::path& directory) {
+    const auto path = directory / "legacy.sqlite";
+    createLegacyLibrary(path);
+    const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
+    const auto store = openStore(path);
+    require(fixtureScalar(path, "PRAGMA user_version") == 2, "opened database must advance to v2");
+    require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
+                fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
+            "backup must retain the v1 schema, document ID and line");
+
+    const auto documents = requireValue(store->documents(), "reading migrated TXT");
+    require(documents.size() == 1 && documents.front().policy() == DocumentPolicy::AllowRemote &&
+                documents.front().content() == std::string("\n\n\n") + decisionsQuote,
+            "migration must preserve TXT content and policy");
+    requireCitation(*store, decisionsQuestion, 42, "decisions.txt", decisionsQuote);
+    requireCitation(*openStore(path), decisionsQuestion, 42, "decisions.txt", decisionsQuote);
+    require(!fs::exists(directory / "legacy.sqlite.v1-backup-1"),
+            "reopening v2 must not repeat the migration");
+}
+
+void migrationFailure(const fs::path& directory) {
+    const auto path = directory / "legacy.sqlite";
+    createLegacyLibrary(path);
+    executeFixtureSql(path, "CREATE VIEW chunks_v1 AS SELECT * FROM chunks");
+    requireError(SqliteKnowledgeStore::open(path), AppError::StoreMigrationFailed,
+                 "a failed migration must report an error");
+    require(fixtureScalar(path, "PRAGMA user_version") == 1 &&
+                fixtureScalar(path, "SELECT id FROM documents") == 42 &&
+                fixtureScalar(path, "SELECT line FROM chunks") == 4,
+            "migration failure must roll back DDL and preserve the original data");
+    const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
+    require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
+                fixtureScalar(backup, "SELECT id FROM documents") == 42,
+            "a failed migration must leave the v1 backup available");
+    executeFixtureSql(path, "DROP VIEW chunks_v1");
+    requireCitation(*openStore(path), decisionsQuestion, 42, "decisions.txt", decisionsQuote);
+    require(fixtureScalar(backup, "SELECT count(*) FROM sqlite_schema WHERE name = 'chunks_v1'") == 1,
+            "retry must not overwrite the original v1 backup");
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -259,6 +335,10 @@ int wmain(int argc, wchar_t* argv[]) {
             rollback(directory.path(), argv[2]);
         } else if (test == L"invalid_database") {
             invalidDatabase(directory.path());
+        } else if (test == L"migration") {
+            migrate(directory.path());
+        } else if (test == L"migration_failure") {
+            migrationFailure(directory.path());
         } else {
             return 2;
         }

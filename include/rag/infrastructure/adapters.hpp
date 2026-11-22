@@ -8,17 +8,25 @@ namespace rag {
 
 class TxtReader final : public IDocumentReader {
 public:
-    Result<std::string> read(const std::filesystem::path& path) const override;
+    Result<std::vector<TextSection>> read(const std::filesystem::path& path) const override;
+};
+
+class PdfReader final : public IDocumentReader {
+public:
+    Result<std::vector<TextSection>> read(const std::filesystem::path& path) const override;
 };
 
 class InMemoryKnowledgeStore final : public IKnowledgeStore {
 public:
     Result<std::size_t> save(std::string source, std::string content,
-                             std::vector<DocumentLine> lines, DocumentPolicy policy) override {
+                             std::vector<DocumentLine> lines, DocumentPolicy policy,
+                             std::string pageLayout = {}) override {
         if (lines.empty()) {
             return AppError::StoreWriteFailed;
         }
-        const auto duplicate = std::ranges::find(documents_, content, &IndexedDocument::content);
+        const auto duplicate = std::ranges::find_if(documents_, [&](const IndexedDocument& doc) {
+            return doc.content() == content && doc.pageLayout() == pageLayout;
+        });
         if (duplicate != documents_.end()) {
             return duplicate->chunks().size();
         }
@@ -32,9 +40,10 @@ public:
         std::vector<Chunk> chunks;
         chunks.reserve(lines.size());
         for (auto& line : lines) {
-            chunks.emplace_back(id, line.number, std::move(line.text));
+            chunks.emplace_back(id, line.number, std::move(line.text), line.page);
         }
-        documents_.emplace_back(id, std::move(source), std::move(content), std::move(chunks), policy);
+        documents_.emplace_back(id, std::move(source), std::move(content), std::move(chunks),
+                                policy, std::move(pageLayout));
         return lines.size();
     }
 
@@ -60,7 +69,7 @@ public:
             return AppError::InvalidCitation;
         }
         const auto& chunk = evidence.front();
-        return ProposedCitation{chunk.line(), chunk.text(), chunk.documentId()};
+        return ProposedCitation{chunk.line(), chunk.text(), chunk.documentId(), chunk.page()};
     }
 };
 

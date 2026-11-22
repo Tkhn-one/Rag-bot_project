@@ -29,12 +29,19 @@ private:
 class FailingKnowledgeStore final : public IKnowledgeStore {
 public:
     Result<std::size_t> save(std::string, std::string, std::vector<DocumentLine>,
-                             DocumentPolicy) override {
+                             DocumentPolicy, std::string) override {
         return AppError::StoreWriteFailed;
     }
 
     Result<std::vector<IndexedDocument>> documents() const override {
         return AppError::StoreReadFailed;
+    }
+};
+
+class PagedReader final : public IDocumentReader {
+public:
+    Result<std::vector<TextSection>> read(const std::filesystem::path&) const override {
+        return std::vector<TextSection>{{"", 1}, {"Orion snapshot.", 2}};
     }
 };
 
@@ -71,8 +78,10 @@ bool encodings(const std::filesystem::path& buildDir) {
             return false;
         }
         const auto content = reader.read(path);
-        const auto* text = std::get_if<std::string>(&content);
-        if (!expect(text && *text == "A", "BOM and encoding must be handled")) {
+        const auto* sections = std::get_if<std::vector<TextSection>>(&content);
+        if (!expect(sections && sections->size() == 1 && sections->front().text == "A" &&
+                        !sections->front().page,
+                    "BOM and encoding must be handled without assigning a page to TXT")) {
             return false;
         }
     }
@@ -92,6 +101,7 @@ bool cites(const Result<Answer>& result, DocumentId id, std::string_view source,
     const auto* answer = std::get_if<Answer>(&result);
     return answer && answer->citation() && answer->citation()->documentId() == id &&
            answer->citation()->source() == source && answer->citation()->line() == demoLine &&
+           !answer->citation()->page() &&
            answer->citation()->quote() == quote;
 }
 
@@ -111,8 +121,12 @@ bool duplicateImport(IndexingService& index, InMemoryKnowledgeStore& store,
         return false;
     }
 
-    if (!expect(index.import(demo) == Result<std::size_t>(chunks) &&
-                    index.import(copy) == Result<std::size_t>(chunks) &&
+    const auto importedOriginal = index.import(demo);
+    const auto importedCopy = index.import(copy);
+    const auto* originalReport = std::get_if<ImportReport>(&importedOriginal);
+    const auto* copyReport = std::get_if<ImportReport>(&importedCopy);
+    if (!expect(originalReport && originalReport->chunks == chunks &&
+                    copyReport && copyReport->chunks == chunks &&
                     store.save("remote.txt", first.content(), {{1, "Replacement"}},
                                DocumentPolicy::AllowRemote) == Result<std::size_t>(chunks),
                 "reimporting known content must return the original chunk count")) {
@@ -126,10 +140,44 @@ bool duplicateImport(IndexingService& index, InMemoryKnowledgeStore& store,
                   "duplicates must preserve the original document identity, name and policy");
 }
 
+bool pagedCitation() {
+    const PagedReader reader;
+    InMemoryKnowledgeStore store;
+    IndexingService index(reader, store);
+    const KeywordRetriever retriever;
+    MockProvider provider;
+    RagService service(store, retriever, provider);
+    const auto imported = index.import("pages.pdf");
+    const auto* report = std::get_if<ImportReport>(&imported);
+    if (!expect(report && report->chunks == 1 && report->pagesWithoutText == std::vector<std::size_t>{1},
+                "a page without text must be listed while preserving the next page's text")) {
+        return false;
+    }
+    const auto result = service.ask("Orion");
+    const auto* answer = std::get_if<Answer>(&result);
+    if (!expect(answer && answer->citation() && answer->citation()->page() == 2,
+                "the citation must point to page 2")) {
+        return false;
+    }
+    const auto& citation = *answer->citation();
+    for (auto page : {std::optional<std::size_t>{1}, std::optional<std::size_t>{}}) {
+        ProbeProvider invalid({citation.line(), citation.quote(), citation.documentId(), page});
+        RagService invalidService(store, retriever, invalid);
+        if (!expect(isError(invalidService.ask("Orion"), AppError::InvalidCitation),
+                    "a missing or incorrect page must invalidate a PDF citation")) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool run(std::string_view test, const std::filesystem::path& demo,
          const std::filesystem::path& buildDir) {
     if (test == "encodings") {
         return encodings(buildDir);
+    }
+    if (test == "paged_citation") {
+        return pagedCitation();
     }
 
     const TxtReader reader;
@@ -169,7 +217,7 @@ bool run(std::string_view test, const std::filesystem::path& demo,
                       "missing file must return FileUnavailable");
     }
 
-    if (!expect(std::holds_alternative<std::size_t>(index.import(demo)),
+    if (!expect(std::holds_alternative<ImportReport>(index.import(demo)),
                 "the demo contract must import successfully")) {
         return false;
     }
@@ -196,7 +244,7 @@ bool run(std::string_view test, const std::filesystem::path& demo,
         }
 
         const auto second = demo.parent_path() / "decisions.txt";
-        if (!expect(std::holds_alternative<std::size_t>(index.import(second)),
+        if (!expect(std::holds_alternative<ImportReport>(index.import(second)),
                     "the second document must import successfully")) {
             return false;
         }
@@ -242,6 +290,7 @@ bool run(std::string_view test, const std::filesystem::path& demo,
         return expect(answer && answer->citation() &&
                           answer->citation()->source() == "contract.txt" &&
                           answer->citation()->line() == 4 &&
+                          !answer->citation()->page() &&
                           answer->citation()->quote() ==
                               "Срок приёмки результата составляет десять рабочих дней.",
                       "expected the original quotation from line 4");

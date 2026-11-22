@@ -4,12 +4,17 @@
 
 namespace rag {
 
+struct ImportReport {
+    std::size_t chunks;
+    std::vector<std::size_t> pagesWithoutText;
+};
+
 class IndexingService {
 public:
     IndexingService(const IDocumentReader& reader, IKnowledgeStore& store)
         : reader_(reader), store_(store) {}
 
-    Result<std::size_t> import(const std::filesystem::path& path);
+    Result<ImportReport> import(const std::filesystem::path& path);
 
 private:
     const IDocumentReader& reader_;

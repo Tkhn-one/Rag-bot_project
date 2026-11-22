@@ -17,6 +17,22 @@
 
 namespace {
 
+class DocumentReader final : public rag::IDocumentReader {
+public:
+    rag::Result<std::vector<rag::TextSection>> read(const std::filesystem::path& path) const override {
+        auto result = txt_.read(path);
+        if (const auto* error = std::get_if<rag::AppError>(&result);
+            error && *error == rag::AppError::UnsupportedFormat) {
+            return pdf_.read(path);
+        }
+        return result;
+    }
+
+private:
+    rag::TxtReader txt_;
+    rag::PdfReader pdf_;
+};
+
 void print(DWORD handleId, std::ostream& stream, const std::string& utf8) {
     if (utf8.empty()) {
         return;
@@ -43,8 +59,8 @@ int wmain(int argc, wchar_t* argv[]) {
     const int minimumArguments = useDatabase ? 4 : 3;
     if (argc < minimumArguments) {
         print(STD_ERROR_HANDLE, std::cerr,
-              "Использование: rag_cli <файл.txt> [<ещё-файл.txt> ...] \"<вопрос>\"\n"
-              "               rag_cli --db <путь-к-базе> [<файл.txt> ...] \"<вопрос>\"\n");
+              "Использование: rag_cli <файл.txt|pdf> [<ещё-файл> ...] \"<вопрос>\"\n"
+              "               rag_cli --db <путь-к-базе> [<файл.txt|pdf> ...] \"<вопрос>\"\n");
         return 2;
     }
 
@@ -66,7 +82,7 @@ int wmain(int argc, wchar_t* argv[]) {
         store = std::make_unique<rag::InMemoryKnowledgeStore>();
     }
 
-    const rag::TxtReader reader;
+    const DocumentReader reader;
     const rag::KeywordRetriever retriever;
     rag::MockProvider provider;
     rag::IndexingService index(reader, *store);

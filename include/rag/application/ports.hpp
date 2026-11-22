@@ -11,20 +11,28 @@ namespace rag {
 struct DocumentLine {
     std::size_t number;
     std::string text;
+    std::optional<std::size_t> page = {};
+};
+
+struct TextSection {
+    std::string text;
+    std::optional<std::size_t> page = {};
 };
 
 class IndexedDocument {
 public:
     IndexedDocument(DocumentId id, std::string source, std::string content,
-                    std::vector<Chunk> chunks, DocumentPolicy policy = DocumentPolicy::LocalOnly)
+                    std::vector<Chunk> chunks, DocumentPolicy policy = DocumentPolicy::LocalOnly,
+                    std::string pageLayout = {})
         : id_(id), source_(std::move(source)), content_(std::move(content)),
-          chunks_(std::move(chunks)), policy_(policy) {}
+          chunks_(std::move(chunks)), policy_(policy), pageLayout_(std::move(pageLayout)) {}
 
     DocumentId id() const noexcept { return id_; }
     const std::string& source() const noexcept { return source_; }
     const std::string& content() const noexcept { return content_; }
     std::span<const Chunk> chunks() const noexcept { return chunks_; }
     DocumentPolicy policy() const noexcept { return policy_; }
+    const std::string& pageLayout() const noexcept { return pageLayout_; }
 
 private:
     DocumentId id_;
@@ -32,12 +40,14 @@ private:
     std::string content_;
     std::vector<Chunk> chunks_;
     DocumentPolicy policy_;
+    std::string pageLayout_;
 };
 
 class IDocumentReader {
 public:
     virtual ~IDocumentReader() = default;
-    virtual Result<std::string> read(const std::filesystem::path& path) const = 0;
+    // TXT returns one unnumbered section. Paginated readers return every page in order.
+    virtual Result<std::vector<TextSection>> read(const std::filesystem::path& path) const = 0;
 };
 
 class IKnowledgeStore {
@@ -45,9 +55,10 @@ public:
     virtual ~IKnowledgeStore() = default;
 
     // Publish the document and its lines together. Line numbers must be positive and unique.
-    // For identical decoded content, keep the existing record. Return the stored chunk count.
+    // Page layout is empty for TXT. For equal content and layout, return the existing chunk count.
     virtual Result<std::size_t> save(std::string source, std::string content,
-                                     std::vector<DocumentLine> lines, DocumentPolicy policy) = 0;
+                                     std::vector<DocumentLine> lines, DocumentPolicy policy,
+                                     std::string pageLayout = {}) = 0;
 
     // Return an owning snapshot ordered by document ID and line number.
     virtual Result<std::vector<IndexedDocument>> documents() const = 0;
@@ -64,6 +75,7 @@ struct ProposedCitation {
     std::size_t line;
     std::string quote;
     DocumentId documentId = 0;
+    std::optional<std::size_t> page = {};
 };
 
 class ILlmProvider {

@@ -13,7 +13,8 @@ public:
     static Result<std::unique_ptr<SqliteKnowledgeStore>> open(const std::filesystem::path& path);
 
     Result<std::size_t> save(std::string source, std::string content,
-                             std::vector<DocumentLine> lines, DocumentPolicy policy) override;
+                             std::vector<DocumentLine> lines, DocumentPolicy policy,
+                             std::string pageLayout = {}) override;
     Result<std::vector<IndexedDocument>> documents() const override;
 
 private:
