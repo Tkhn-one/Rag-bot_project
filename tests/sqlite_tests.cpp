@@ -131,12 +131,17 @@ void reopen(const fs::path& directory, const fs::path& demo) {
     const TxtReader reader;
     const auto content = requireValue(reader.read(decisions), "decoding demo TXT").sections.front().text;
     DocumentId decisionsId = 0;
+    IndexRevision savedRevision;
     {
         auto store = openStore(path);
         IndexingService index(reader, *store);
         requireValue(index.import(demo / "contract.txt"), "importing the contract");
         requireValue(index.import(decisions), "importing the decisions");
-        const auto documents = requireValue(store->documents(), "reading imported library");
+        const auto snapshot = requireValue(store->snapshot(), "reading imported library");
+        savedRevision = snapshot.revision;
+        const auto& documents = snapshot.documents;
+        require(!savedRevision.libraryId.empty() && savedRevision.number == 2,
+                "two imports must advance this library's revision twice");
         require(documents.size() == 2, "expected two documents before reopening");
         decisionsId = documents.back().id();
         require(decisionsId != 0 && decisionsId != documents.front().id(), "documents need unique IDs");
@@ -144,7 +149,10 @@ void reopen(const fs::path& directory, const fs::path& demo) {
     }
 
     auto store = openStore(path);
-    const auto documents = requireValue(store->documents(), "reading reopened library");
+    const auto snapshot = requireValue(store->snapshot(), "reading reopened library");
+    require(snapshot.revision == savedRevision && snapshot.policy == DocumentPolicy::LocalOnly,
+            "reopening must preserve both the library identity and revision");
+    const auto& documents = snapshot.documents;
     require(documents.size() == 2 && documents.back().id() == decisionsId &&
                 documents.back().content() == content &&
                 documents.back().policy() == DocumentPolicy::LocalOnly,
@@ -163,7 +171,7 @@ void duplicate(const fs::path& directory, const fs::path& demo) {
         auto store = openStore(path);
         requireValue(store->save("original's.txt", content, {{4, quote}}, DocumentPolicy::AllowRemote),
                      "saving original content and explicit policy");
-        const auto documents = requireValue(store->documents(), "reading original document");
+        const auto documents = requireValue(store->snapshot(), "reading original document").documents;
         require(documents.size() == 1, "expected only the original document");
         originalId = documents.front().id();
     }
@@ -173,11 +181,13 @@ void duplicate(const fs::path& directory, const fs::path& demo) {
         IndexingService index(reader, *store);
         require(requireValue(index.import(copy), "reimporting a renamed TXT with a BOM").chunks == 1,
                 "duplicate import must return the original chunk count");
+        require(requireValue(store->snapshot(), "reading after duplicate").revision.number == 1,
+                "duplicate import must not advance the revision");
         requireValue(index.import(demo / "decisions.txt"), "importing different content");
     }
 
     auto store = openStore(path);
-    const auto documents = requireValue(store->documents(), "checking the library after duplicate import");
+    const auto documents = requireValue(store->snapshot(), "checking the library after duplicate import").documents;
     require(documents.size() == 2 && documents.front().id() == originalId &&
                 documents.front().policy() == DocumentPolicy::AllowRemote &&
                 documents.back().id() != originalId && documents.back().policy() == DocumentPolicy::LocalOnly,
@@ -195,7 +205,7 @@ void rollback(const fs::path& directory, const fs::path& demo) {
         auto store = openStore(path);
         IndexingService index(reader, *store);
         requireValue(index.import(demo / "decisions.txt"), "importing the original document");
-        const auto documents = requireValue(store->documents(), "reading the original library");
+        const auto documents = requireValue(store->snapshot(), "reading the original library").documents;
         require(documents.size() == 1, "expected one document before injecting the failure");
         originalId = documents.front().id();
         executeFixtureSql(path, R"sql(
@@ -206,22 +216,25 @@ void rollback(const fs::path& directory, const fs::path& demo) {
         )sql");
         requireError(index.import(fixture), AppError::StoreWriteFailed,
                      "the second chunk's SQLite failure must reach Application");
-        const auto afterFailure = requireValue(store->documents(), "reading after failed import");
-        require(afterFailure.size() == 1 && afterFailure.front().id() == originalId,
+        const auto afterFailure = requireValue(store->snapshot(), "reading after failed import");
+        require(afterFailure.revision.number == 1 && afterFailure.documents.size() == 1 &&
+                    afterFailure.documents.front().id() == originalId,
                 "no part of the failed document should be visible");
     }
 
     auto store = openStore(path);
-    const auto afterReopen = requireValue(store->documents(), "reading after rollback and reopening");
-    require(afterReopen.size() == 1, "rollback must survive reopening the library");
+    const auto afterReopen = requireValue(store->snapshot(), "reading after rollback and reopening");
+    require(afterReopen.documents.size() == 1 && afterReopen.revision.number == 1,
+            "rollback must survive reopening the library");
     requireCitation(*store, decisionsQuestion, originalId, "decisions.txt", decisionsQuote);
 
     executeFixtureSql(path, "DROP TRIGGER fail_second_chunk");
     IndexingService index(reader, *store);
     require(requireValue(index.import(fixture), "retrying after rollback").chunks == 2,
             "the retry must publish both chunks");
-    const auto afterRetry = requireValue(store->documents(), "reading after retry");
-    require(afterRetry.size() == 2 && afterRetry.back().chunks().size() == 2,
+    const auto afterRetry = requireValue(store->snapshot(), "reading after retry");
+    require(afterRetry.revision.number == 2 && afterRetry.documents.size() == 2 &&
+                afterRetry.documents.back().chunks().size() == 2,
             "retry must publish exactly one complete document");
 }
 
@@ -258,6 +271,55 @@ void invalidDatabase(const fs::path& directory) {
     require(readFixture(foreign) == original, "opening an unrelated database must preserve its bytes");
 }
 
+void policyRevisions(const fs::path& directory, const fs::path& demo) {
+    const auto path = directory / "policies.sqlite";
+    const auto observer = openStore(path);
+    const auto initial = requireValue(observer->snapshot(), "reading initial library");
+    const auto other = requireValue(openStore(directory / "other.sqlite")->snapshot(), "reading second library");
+    require(initial.revision.number == 0 && initial.policy == DocumentPolicy::LocalOnly &&
+                initial.revision.libraryId != other.revision.libraryId,
+            "each new library needs its own identity and closed policy at revision zero");
+    const TxtReader reader;
+    auto writer = openStore(path);
+    IndexingService index(reader, *writer);
+    require(requireValue(writer->setLibraryPolicy(DocumentPolicy::AllowRemote), "granting library access"),
+            "library grant must be a change");
+    requireValue(index.import(demo / "contract.txt"), "importing into an open library");
+    const auto mixed = requireValue(observer->snapshot(), "reading from another connection");
+    require(mixed.revision.number == 2 && mixed.revision.libraryId == initial.revision.libraryId &&
+                mixed.policy == DocumentPolicy::AllowRemote && mixed.documents.size() == 1 &&
+                mixed.documents.front().policy() == DocumentPolicy::LocalOnly,
+            "library access must not grant access to a new document");
+    const auto id = mixed.documents.front().id();
+    require(requireValue(writer->setDocumentPolicy(id, DocumentPolicy::AllowRemote), "granting document access"),
+            "document grant must be a change");
+    require(!requireValue(writer->setDocumentPolicy(id, DocumentPolicy::AllowRemote), "repeating document grant") &&
+                !requireValue(writer->setLibraryPolicy(DocumentPolicy::AllowRemote), "repeating library grant"),
+            "repeating a policy must return false");
+    requireError(writer->setDocumentPolicy(id + 1, DocumentPolicy::LocalOnly), AppError::StoreWriteFailed,
+                 "a missing document must report an error");
+
+    executeFixtureSql(path, R"sql(
+        CREATE TRIGGER fail_revision BEFORE UPDATE OF revision ON library BEGIN
+            SELECT RAISE(ABORT, 'test revision failure');
+        END;
+    )sql");
+    requireError(writer->setDocumentPolicy(id, DocumentPolicy::LocalOnly), AppError::StoreWriteFailed,
+                 "a failed revision update must abort the document policy change");
+    requireError(writer->setLibraryPolicy(DocumentPolicy::LocalOnly), AppError::StoreWriteFailed,
+                 "a failed revision update must abort the library policy change");
+    requireError(index.import(demo / "decisions.txt"), AppError::StoreWriteFailed,
+                 "a failed revision update must abort document publication");
+
+    const auto latest = requireValue(openStore(path)->snapshot(), "reading persisted policies and revision");
+    require(latest.revision.number == 3 && latest.revision.libraryId == initial.revision.libraryId &&
+                latest.policy == DocumentPolicy::AllowRemote && latest.documents.size() == 1 &&
+                latest.documents.front().policy() == DocumentPolicy::AllowRemote,
+            "only committed changes may survive reopening");
+    require(mixed.documents.front().policy() == DocumentPolicy::LocalOnly && initial.documents.empty(),
+            "snapshots already returned must retain the state of their own revisions");
+}
+
 void createLegacyLibrary(const fs::path& path) {
     executeFixtureSql(path, R"sql(
         CREATE TABLE documents (
@@ -283,19 +345,19 @@ void migrate(const fs::path& directory) {
     createLegacyLibrary(path);
     const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 3, "opened database must advance to v3");
+    require(fixtureScalar(path, "PRAGMA user_version") == 4, "opened database must advance to v4");
     require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
                 fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
             "backup must retain the v1 schema, document ID and line");
 
-    const auto documents = requireValue(store->documents(), "reading migrated TXT");
+    const auto documents = requireValue(store->snapshot(), "reading migrated TXT").documents;
     require(documents.size() == 1 && documents.front().policy() == DocumentPolicy::AllowRemote &&
                 documents.front().content() == std::string("\n\n\n") + decisionsQuote,
             "migration must preserve TXT content and policy");
     requireCitation(*store, decisionsQuestion, 42, "decisions.txt", decisionsQuote);
     requireCitation(*openStore(path), decisionsQuestion, 42, "decisions.txt", decisionsQuote);
     require(!fs::exists(directory / "legacy.sqlite.v1-backup-1"),
-            "reopening v3 must not repeat the migration");
+            "reopening v4 must not repeat the migration");
 }
 
 void migrationFailure(const fs::path& directory) {
@@ -341,7 +403,7 @@ void migratePdfEra(const fs::path& directory) {
             (42, 1, 'Orion snapshot runs every Friday.', 2);
     )sql");
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 3, "v2 must advance to v3");
+    require(fixtureScalar(path, "PRAGMA user_version") == 4, "v2 must advance to v4");
     const auto backup = directory / "pdf-era.sqlite.v2-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 2 &&
                 fixtureScalar(backup, "SELECT page FROM chunks WHERE document_id = 42") == 2,
@@ -355,6 +417,48 @@ void migratePdfEra(const fs::path& directory) {
                 pdf.citation()->source() == "protocol.pdf" && pdf.citation()->page() == 2 &&
                 !pdf.citation()->docx() && pdf.citation()->quote() == "Orion snapshot runs every Friday.",
             "migration must preserve PDF citation, page and ID");
+}
+
+void migrateDocxEra(const fs::path& directory) {
+    const auto path = directory / "docx-era.sqlite";
+    executeFixtureSql(path, R"sql(
+        CREATE TABLE documents (
+            id INTEGER PRIMARY KEY, source TEXT NOT NULL, content TEXT NOT NULL COLLATE BINARY,
+            policy INTEGER NOT NULL CHECK (policy IN (0, 1)), position_layout TEXT NOT NULL,
+            UNIQUE (content, position_layout)
+        ) STRICT;
+        CREATE TABLE chunks (
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            line INTEGER NOT NULL, text TEXT NOT NULL, page INTEGER,
+            docx_part TEXT, docx_paragraph INTEGER, docx_table INTEGER, docx_row INTEGER, docx_cell INTEGER,
+            PRIMARY KEY (document_id, line)
+        ) STRICT, WITHOUT ROWID;
+        PRAGMA application_id = 0x52414742;
+        PRAGMA user_version = 3;
+        INSERT INTO documents VALUES (17, 'register.docx', 'Intro' || char(10) || 'Orion', 1, 'docx:layout');
+        INSERT INTO chunks VALUES
+            (17, 1, 'Intro', NULL, 'word/document.xml', 4, NULL, NULL, NULL),
+            (17, 2, 'Orion', NULL, 'word/document.xml', NULL, 1, 2, 3);
+    )sql");
+    const auto store = openStore(path);
+    const auto backup = directory / "docx-era.sqlite.v3-backup" / "library.sqlite";
+    require(fixtureScalar(backup, "PRAGMA user_version") == 3 &&
+                fixtureScalar(backup, "SELECT docx_row FROM chunks WHERE document_id = 17 AND line = 2") == 2 &&
+                fixtureScalar(path, "PRAGMA user_version") == 4, "migration must preserve a readable v3 backup");
+    const auto snapshot = requireValue(store->snapshot(), "reading migrated v3 library");
+    require(snapshot.revision.number == 0 && snapshot.policy == DocumentPolicy::LocalOnly &&
+                snapshot.documents.size() == 1, "migration starts a closed library at its baseline revision");
+    const auto& doc = snapshot.documents.front();
+    require(doc.id() == 17 && doc.content() == "Intro\nOrion" && doc.source() == "register.docx" &&
+                doc.policy() == DocumentPolicy::AllowRemote && doc.positionLayout() == "docx:layout" &&
+                doc.chunks().size() == 2 && doc.chunks()[0].line() == 1 && doc.chunks()[0].text() == "Intro" &&
+                doc.chunks()[0].docx() == DocxPosition{"word/document.xml", std::size_t{4}} &&
+                doc.chunks()[1].line() == 2 && doc.chunks()[1].text() == "Orion" &&
+                doc.chunks()[1].docx() == DocxPosition{"word/document.xml", TableCell{1, 2, 3}},
+            "migration must preserve the document identity, policy and both DOCX anchor types");
+    require(requireValue(openStore(path)->snapshot(), "reopening migrated library").revision == snapshot.revision &&
+                !fs::exists(directory / "docx-era.sqlite.v3-backup-1"),
+            "reopening must preserve the migrated identity without repeating the migration");
 }
 
 }  // namespace
@@ -380,6 +484,10 @@ int wmain(int argc, wchar_t* argv[]) {
             migrationFailure(directory.path());
         } else if (test == L"migration_v2") {
             migratePdfEra(directory.path());
+        } else if (test == L"migration_v3") {
+            migrateDocxEra(directory.path());
+        } else if (test == L"policy_revisions") {
+            policyRevisions(directory.path(), argv[2]);
         } else {
             return 2;
         }

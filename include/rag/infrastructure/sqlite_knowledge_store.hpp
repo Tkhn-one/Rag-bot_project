@@ -15,7 +15,9 @@ public:
     Result<std::size_t> save(std::string source, std::string content,
                              std::vector<DocumentLine> lines, DocumentPolicy policy,
                              std::string positionLayout = {}) override;
-    Result<std::vector<IndexedDocument>> documents() const override;
+    Result<LibrarySnapshot> snapshot() const override;
+    Result<bool> setLibraryPolicy(DocumentPolicy policy) override;
+    Result<bool> setDocumentPolicy(DocumentId id, DocumentPolicy policy) override;
 
 private:
     struct CloseDatabase {

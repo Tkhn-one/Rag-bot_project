@@ -122,14 +122,15 @@ if(BUILD_TESTING)
     foreach(case IN ITEMS answer empty_file empty_question no_match
                           unknown_citation altered_quote missing_file encodings second_document
                           duplicate_import failed_import_preserves_library wrong_document_citation
-                          store_errors paged_citation)
+                          store_errors paged_citation provider_access)
         add_test(NAME ${case}
                  COMMAND rag_tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}/data/demo/contract.txt"
                          "${CMAKE_CURRENT_BINARY_DIR}")
     endforeach()
     add_executable(rag_sqlite_tests tests/sqlite_tests.cpp)
     target_link_libraries(rag_sqlite_tests PRIVATE rag_infrastructure rag_sqlite)
-    foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure migration_v2)
+    foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure
+                          migration_v2 migration_v3 policy_revisions)
         add_test(NAME sqlite_${case}
                  COMMAND rag_sqlite_tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
                          "${CMAKE_CURRENT_BINARY_DIR}")

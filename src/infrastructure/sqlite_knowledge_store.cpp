@@ -7,7 +7,7 @@ namespace rag {
 namespace {
 
 constexpr int applicationId = 0x52414742;  // RAGB
-constexpr int schemaVersion = 3;
+constexpr int schemaVersion = 4;
 constexpr auto createV2Schema = R"sql(
     CREATE TABLE documents (
         id INTEGER PRIMARY KEY,
@@ -44,6 +44,17 @@ constexpr auto addDocxPositions = R"sql(
         ))
     );
     PRAGMA user_version = 3;
+)sql";
+constexpr auto addLibraryMetadata = R"sql(
+    CREATE TABLE library (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        library_id TEXT NOT NULL CHECK (length(library_id) = 32),
+        revision INTEGER NOT NULL CHECK (revision >= 0),
+        policy INTEGER NOT NULL CHECK (policy IN (0, 1))
+    ) STRICT;
+    INSERT INTO library (id, library_id, revision, policy)
+        VALUES (1, lower(hex(randomblob(16))), 0, 0);
+    PRAGMA user_version = 4;
 )sql";
 
 using Statement = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
@@ -115,7 +126,7 @@ struct Schema {
     bool hasObjects;
 
     bool supported() const { return application == applicationId && version == schemaVersion; }
-    bool migratable() const { return application == applicationId && (version == 1 || version == 2); }
+    bool migratable() const { return application == applicationId && version >= 1 && version < schemaVersion; }
     bool uninitialized() const { return application == 0 && version == 0 && !hasObjects; }
 };
 
@@ -146,7 +157,8 @@ std::optional<AppError> initializeSchema(sqlite3* database) {
         if (!schema->uninitialized()) {
             return AppError::StoreSchemaUnsupported;
         }
-        if (!execute(database, createV2Schema) || !execute(database, addDocxPositions)) {
+        if (!execute(database, createV2Schema) || !execute(database, addDocxPositions) ||
+            !execute(database, addLibraryMetadata)) {
             return databaseError(database, AppError::StoreWriteFailed);
         }
     }
@@ -259,7 +271,9 @@ std::optional<AppError> migrateLegacy(sqlite3* database, const std::filesystem::
             return error;
         }
         if (!backupLegacy(path, filename, schema->version) ||
-            (schema->version == 1 && !upgradeV1(database)) || !execute(database, addDocxPositions)) {
+            (schema->version == 1 && !upgradeV1(database)) ||
+            (schema->version <= 2 && !execute(database, addDocxPositions)) ||
+            !execute(database, addLibraryMetadata)) {
             return databaseError(database, AppError::StoreMigrationFailed);
         }
     }
@@ -315,6 +329,11 @@ Result<std::size_t> duplicateChunkCount(sqlite3* database, const std::string& co
     return static_cast<std::size_t>(count);
 }
 
+bool advanceRevision(sqlite3* database) {
+    return execute(database, "UPDATE library SET revision = revision + 1 WHERE id = 1") &&
+           sqlite3_changes(database) == 1;
+}
+
 Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
                                   const std::string& content, std::span<const DocumentLine> lines,
                                   DocumentPolicy policy, const std::string& positionLayout) {
@@ -350,7 +369,35 @@ Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
             return databaseError(database, AppError::StoreWriteFailed);
         }
     }
+    if (!advanceRevision(database)) {
+        return databaseError(database, AppError::StoreWriteFailed);
+    }
     return lines.size();
+}
+
+Result<bool> changePolicy(sqlite3* database, sqlite3_int64 id, DocumentPolicy policy,
+                          const char* readSql, const char* updateSql) {
+    WriteTransaction transaction(database);
+    if (!transaction.started()) {
+        return databaseError(database, AppError::StoreWriteFailed);
+    }
+    const int requested = policy == DocumentPolicy::AllowRemote ? 1 : 0;
+    const auto current = prepare(database, readSql);
+    if (!current || sqlite3_bind_int64(current.get(), 1, id) != SQLITE_OK ||
+        sqlite3_step(current.get()) != SQLITE_ROW) {
+        return databaseError(database, AppError::StoreWriteFailed);
+    }
+    if (sqlite3_column_int(current.get(), 0) == requested) {
+        return false;
+    }
+    const auto update = prepare(database, updateSql);
+    if (!update || sqlite3_bind_int64(update.get(), 1, id) != SQLITE_OK ||
+        sqlite3_bind_int(update.get(), 2, requested) != SQLITE_OK ||
+        sqlite3_step(update.get()) != SQLITE_DONE || sqlite3_changes(database) != 1 ||
+        !advanceRevision(database) || !transaction.commit()) {
+        return databaseError(database, AppError::StoreWriteFailed);
+    }
+    return true;
 }
 
 std::optional<std::size_t> readPositionNumber(sqlite3_stmt* query, int column) {
@@ -487,8 +534,42 @@ Result<std::size_t> SqliteKnowledgeStore::save(std::string source, std::string c
     return result;
 }
 
-Result<std::vector<IndexedDocument>> SqliteKnowledgeStore::documents() const {
+Result<bool> SqliteKnowledgeStore::setLibraryPolicy(DocumentPolicy policy) {
+    return changePolicy(database_.get(), 1, policy, "SELECT policy FROM library WHERE id = ?1",
+                        "UPDATE library SET policy = ?2 WHERE id = ?1");
+}
+
+Result<bool> SqliteKnowledgeStore::setDocumentPolicy(DocumentId id, DocumentPolicy policy) {
+    if (!std::in_range<sqlite3_int64>(id)) {
+        return AppError::StoreWriteFailed;
+    }
+    return changePolicy(database_.get(), static_cast<sqlite3_int64>(id), policy,
+                        "SELECT policy FROM documents WHERE id = ?1",
+                        "UPDATE documents SET policy = ?2 WHERE id = ?1");
+}
+
+Result<LibrarySnapshot> SqliteKnowledgeStore::snapshot() const {
     auto* database = database_.get();
+    // Keep this SELECT on its row until all documents and chunks have been copied.
+    // The active cursor pins SQLite's read transaction, including for an empty library.
+    const auto metadata = prepare(database, "SELECT library_id, revision, policy FROM library WHERE id = 1");
+    if (!metadata) {
+        return databaseError(database, AppError::StoreReadFailed);
+    }
+    const auto metadataStatus = sqlite3_step(metadata.get());
+    if (metadataStatus != SQLITE_ROW) {
+        return metadataStatus == SQLITE_DONE ? AppError::StoreCorrupt :
+                                               databaseError(database, AppError::StoreReadFailed);
+    }
+    auto libraryId = readText(metadata.get(), 0);
+    const auto number = sqlite3_column_int64(metadata.get(), 1);
+    const auto libraryPolicy = sqlite3_column_int(metadata.get(), 2);
+    if (!libraryId || libraryId->size() != 32 || number < 0 || (libraryPolicy != 0 && libraryPolicy != 1)) {
+        return AppError::StoreCorrupt;
+    }
+    LibrarySnapshot result{{std::move(*libraryId), static_cast<std::uint64_t>(number)},
+                           libraryPolicy == 1 ? DocumentPolicy::AllowRemote : DocumentPolicy::LocalOnly, {}};
+
     const auto documents = prepare(database,
         "SELECT id, source, content, policy, position_layout FROM documents ORDER BY id");
     const auto chunks = prepare(database, R"sql(
@@ -499,9 +580,7 @@ Result<std::vector<IndexedDocument>> SqliteKnowledgeStore::documents() const {
         return databaseError(database, AppError::StoreReadFailed);
     }
 
-    std::vector<IndexedDocument> result;
     int status = SQLITE_OK;
-    // The active document statement keeps the read snapshot open while reading its chunks.
     while ((status = sqlite3_step(documents.get())) == SQLITE_ROW) {
         const auto id = sqlite3_column_int64(documents.get(), 0);
         auto source = readText(documents.get(), 1);
@@ -516,10 +595,10 @@ Result<std::vector<IndexedDocument>> SqliteKnowledgeStore::documents() const {
         if (const auto* error = std::get_if<AppError>(&storedChunks)) {
             return *error;
         }
-        result.emplace_back(static_cast<DocumentId>(id), std::move(*source), std::move(*content),
-                            std::get<std::vector<Chunk>>(std::move(storedChunks)),
-                            policy == 1 ? DocumentPolicy::AllowRemote : DocumentPolicy::LocalOnly,
-                            std::move(*positionLayout));
+        result.documents.emplace_back(static_cast<DocumentId>(id), std::move(*source), std::move(*content),
+                                      std::get<std::vector<Chunk>>(std::move(storedChunks)),
+                                      policy == 1 ? DocumentPolicy::AllowRemote : DocumentPolicy::LocalOnly,
+                                      std::move(*positionLayout));
     }
     if (status != SQLITE_DONE) {
         return databaseError(database, AppError::StoreReadFailed);

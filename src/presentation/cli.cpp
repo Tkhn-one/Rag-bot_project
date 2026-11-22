@@ -21,10 +21,12 @@ std::string_view describeError(AppError error) {
         return "Введите вопрос.";
     case AppError::InvalidCitation:
         return "Тестовый провайдер вернул неподтверждённую цитату.";
+    case AppError::RemoteProcessingDenied:
+        return "Внешняя обработка запрещена. Для неё требуется разрешение библиотеки и каждого документа.";
     case AppError::StoreReadFailed:
         return "Не удалось прочитать библиотеку документов.";
     case AppError::StoreWriteFailed:
-        return "Не удалось сохранить документ в библиотеке.";
+        return "Не удалось сохранить изменения в библиотеке.";
     case AppError::StoreUnavailable:
         return "Не удалось открыть базу SQLite. Проверьте путь и права доступа.";
     case AppError::StoreCorrupt:

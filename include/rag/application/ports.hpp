@@ -39,6 +39,7 @@ public:
     const std::string& content() const noexcept { return content_; }
     std::span<const Chunk> chunks() const noexcept { return chunks_; }
     DocumentPolicy policy() const noexcept { return policy_; }
+    void setPolicy(DocumentPolicy policy) noexcept { policy_ = policy; }
     const std::string& positionLayout() const noexcept { return positionLayout_; }
 
 private:
@@ -48,6 +49,12 @@ private:
     std::vector<Chunk> chunks_;
     DocumentPolicy policy_;
     std::string positionLayout_;
+};
+
+struct LibrarySnapshot {
+    IndexRevision revision;
+    DocumentPolicy policy;
+    std::vector<IndexedDocument> documents;
 };
 
 class IDocumentReader {
@@ -67,8 +74,12 @@ public:
                                      std::vector<DocumentLine> lines, DocumentPolicy policy,
                                      std::string positionLayout = {}) = 0;
 
-    // Return an owning snapshot ordered by document ID and line number.
-    virtual Result<std::vector<IndexedDocument>> documents() const = 0;
+    // Read metadata, policies and ordered documents at one revision.
+    virtual Result<LibrarySnapshot> snapshot() const = 0;
+
+    // Return true for a committed change, false for an already active policy.
+    virtual Result<bool> setLibraryPolicy(DocumentPolicy policy) = 0;
+    virtual Result<bool> setDocumentPolicy(DocumentId id, DocumentPolicy policy) = 0;
 };
 
 class IRetriever {
@@ -89,6 +100,8 @@ struct ProposedCitation {
 class ILlmProvider {
 public:
     virtual ~ILlmProvider() = default;
+    // Local metadata for the configured provider, stable throughout an ask operation.
+    virtual ModelProfile profile() const = 0;
     virtual Result<ProposedCitation> generate(const Question& question,
                                                std::span<const Chunk> evidence) = 0;
 };

@@ -12,7 +12,12 @@ using namespace rag;
 
 class ProbeProvider final : public ILlmProvider {
 public:
-    explicit ProbeProvider(ProposedCitation proposal) : proposal_(std::move(proposal)) {}
+    explicit ProbeProvider(ProposedCitation proposal, ProcessingType processing = ProcessingType::Local)
+        : proposal_(std::move(proposal)), processing_(processing) {}
+
+    ModelProfile profile() const override {
+        return {processing_, processing_ == ProcessingType::Local ? "test-local" : "test-remote"};
+    }
 
     Result<ProposedCitation> generate(const Question&, std::span<const Chunk>) override {
         ++calls_;
@@ -23,6 +28,7 @@ public:
 
 private:
     ProposedCitation proposal_;
+    ProcessingType processing_;
     int calls_ = 0;
 };
 
@@ -33,9 +39,9 @@ public:
         return AppError::StoreWriteFailed;
     }
 
-    Result<std::vector<IndexedDocument>> documents() const override {
-        return AppError::StoreReadFailed;
-    }
+    Result<LibrarySnapshot> snapshot() const override { return AppError::StoreReadFailed; }
+    Result<bool> setLibraryPolicy(DocumentPolicy) override { return AppError::StoreWriteFailed; }
+    Result<bool> setDocumentPolicy(DocumentId, DocumentPolicy) override { return AppError::StoreWriteFailed; }
 };
 
 class PagedReader final : public IDocumentReader {
@@ -106,7 +112,64 @@ bool cites(const Result<Answer>& result, DocumentId id, std::string_view source,
 }
 
 std::vector<IndexedDocument> storedDocuments(const InMemoryKnowledgeStore& store) {
-    return std::get<std::vector<IndexedDocument>>(store.documents());
+    return std::get<LibrarySnapshot>(store.snapshot()).documents;
+}
+
+class CountingRetriever final : public IRetriever {
+public:
+    std::vector<Chunk> retrieve(const Question& question,
+                                std::span<const IndexedDocument> documents) const override {
+        ++calls;
+        return KeywordRetriever{}.retrieve(question, documents);
+    }
+
+    mutable int calls = 0;
+};
+
+bool providerAccess(const std::filesystem::path& demo) {
+    InMemoryKnowledgeStore store;
+    const TxtReader reader;
+    IndexingService index(reader, store);
+    if (!expect(std::holds_alternative<ImportReport>(index.import(demo)) &&
+                    std::holds_alternative<ImportReport>(index.import(demo.parent_path() / "decisions.txt")),
+                "both documents must import")) {
+        return false;
+    }
+    const auto documents = storedDocuments(store);
+    if (!expect(documents.size() == 2, "the selected library must contain both documents")) {
+        return false;
+    }
+    const auto contract = documents.front().id();
+    const auto decisions = documents.back().id();
+    CountingRetriever retriever;
+    ProbeProvider remote({demoLine, std::string(contractQuote), contract}, ProcessingType::Remote);
+    RagService external(store, retriever, remote);
+    if (!expect(store.setLibraryPolicy(DocumentPolicy::AllowRemote) == Result<bool>(true) &&
+                    store.setDocumentPolicy(contract, DocumentPolicy::AllowRemote) == Result<bool>(true),
+                "explicit grants must leave the decisions document closed") ||
+        !expect(isError(external.ask("срок приёмки"), AppError::RemoteProcessingDenied) &&
+                    retriever.calls == 0 && remote.calls() == 0,
+                "a closed document must block even a question about the open document before retrieval")) {
+        return false;
+    }
+
+    ProbeProvider local({demoLine, std::string(decisionsQuote), decisions});
+    RagService offline(store, retriever, local);
+    if (!expect(cites(offline.ask("Резервное копирование"), decisions, "decisions.txt", decisionsQuote) &&
+                    retriever.calls == 1 && local.calls() == 1 && remote.calls() == 0,
+                "the same mixed library must answer locally from the closed document") ||
+        !expect(store.setDocumentPolicy(decisions, DocumentPolicy::AllowRemote) == Result<bool>(true) &&
+                    store.setLibraryPolicy(DocumentPolicy::LocalOnly) == Result<bool>(true),
+                "both documents should now allow remote processing while the library forbids it") ||
+        !expect(isError(external.ask("срок приёмки"), AppError::RemoteProcessingDenied) &&
+                    retriever.calls == 1 && remote.calls() == 0,
+                "a closed library must block before retrieval even when all documents allow remote access")) {
+        return false;
+    }
+    return expect(store.setLibraryPolicy(DocumentPolicy::AllowRemote) == Result<bool>(true) &&
+                      cites(external.ask("срок приёмки"), contract, "contract.txt", contractQuote) &&
+                      retriever.calls == 2 && remote.calls() == 1,
+                  "the external test provider must run once when all permissions are granted");
 }
 
 bool duplicateImport(IndexingService& index, InMemoryKnowledgeStore& store,
@@ -178,6 +241,9 @@ bool run(std::string_view test, const std::filesystem::path& demo,
     }
     if (test == "paged_citation") {
         return pagedCitation();
+    }
+    if (test == "provider_access") {
+        return providerAccess(demo);
     }
 
     const TxtReader reader;

@@ -3,6 +3,7 @@
 #include "rag/application/ports.hpp"
 
 #include <algorithm>
+#include <random>
 
 namespace rag {
 
@@ -23,6 +24,16 @@ public:
 
 class InMemoryKnowledgeStore final : public IKnowledgeStore {
 public:
+    InMemoryKnowledgeStore() {
+        std::random_device random;
+        std::uniform_int_distribution<int> digit(0, 15);
+        for (int i = 0; i < 32; ++i) {
+            revision_.libraryId += "0123456789abcdef"[digit(random)];
+        }
+    }
+    InMemoryKnowledgeStore(const InMemoryKnowledgeStore&) = delete;
+    InMemoryKnowledgeStore& operator=(const InMemoryKnowledgeStore&) = delete;
+
     Result<std::size_t> save(std::string source, std::string content,
                              std::vector<DocumentLine> lines, DocumentPolicy policy,
                              std::string positionLayout = {}) override {
@@ -49,14 +60,39 @@ public:
         }
         documents_.emplace_back(id, std::move(source), std::move(content), std::move(chunks),
                                 policy, std::move(positionLayout));
+        ++revision_.number;
         return lines.size();
     }
 
-    Result<std::vector<IndexedDocument>> documents() const override {
-        return documents_;
+    Result<LibrarySnapshot> snapshot() const override {
+        return LibrarySnapshot{revision_, policy_, documents_};
+    }
+
+    Result<bool> setLibraryPolicy(DocumentPolicy policy) override {
+        if (policy_ == policy) {
+            return false;
+        }
+        policy_ = policy;
+        ++revision_.number;
+        return true;
+    }
+
+    Result<bool> setDocumentPolicy(DocumentId id, DocumentPolicy policy) override {
+        const auto document = std::ranges::find(documents_, id, &IndexedDocument::id);
+        if (document == documents_.end()) {
+            return AppError::StoreWriteFailed;
+        }
+        if (document->policy() == policy) {
+            return false;
+        }
+        document->setPolicy(policy);
+        ++revision_.number;
+        return true;
     }
 
 private:
+    IndexRevision revision_{};
+    DocumentPolicy policy_ = DocumentPolicy::LocalOnly;
     std::vector<IndexedDocument> documents_;
 };
 
@@ -68,6 +104,8 @@ public:
 
 class MockProvider final : public ILlmProvider {
 public:
+    ModelProfile profile() const override { return {ProcessingType::Local, "mock-extractive-v1"}; }
+
     Result<ProposedCitation> generate(const Question&,
                                        std::span<const Chunk> evidence) override {
         if (evidence.empty()) {

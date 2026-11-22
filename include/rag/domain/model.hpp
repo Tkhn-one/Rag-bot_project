@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
@@ -28,7 +29,8 @@ enum class AppError {
     PdfTextTooLarge,
     DocxCorrupt,
     DocxNoText,
-    DocxLimitExceeded
+    DocxLimitExceeded,
+    RemoteProcessingDenied
 };
 
 template <typename T>
@@ -37,6 +39,20 @@ using Result = std::variant<T, AppError>;
 using DocumentId = std::size_t;
 
 enum class DocumentPolicy { LocalOnly, AllowRemote };
+
+struct IndexRevision {
+    std::string libraryId;
+    std::uint64_t number = 0;
+
+    bool operator==(const IndexRevision&) const = default;
+};
+
+enum class ProcessingType { Local, Remote };
+
+struct ModelProfile {
+    ProcessingType processing;
+    std::string modelId;
+};
 
 struct TableCell {
     std::size_t table, row, cell;

@@ -98,12 +98,20 @@ Result<Answer> RagService::ask(std::string text) {
         return *error;
     }
 
-    const auto snapshot = store_.documents();
+    const auto snapshot = store_.snapshot();
     if (const auto* error = std::get_if<AppError>(&snapshot)) {
         return *error;
     }
 
-    const auto& documents = std::get<std::vector<IndexedDocument>>(snapshot);
+    const auto& library = std::get<LibrarySnapshot>(snapshot);
+    const auto& documents = library.documents;
+    if (provider_.profile().processing != ProcessingType::Local &&
+        (library.policy != DocumentPolicy::AllowRemote ||
+         !std::ranges::all_of(documents, [](const IndexedDocument& document) {
+             return document.policy() == DocumentPolicy::AllowRemote;
+         }))) {
+        return AppError::RemoteProcessingDenied;
+    }
     if (documents.empty()) {
         return Answer{};
     }
