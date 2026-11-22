@@ -4,6 +4,21 @@
 #include <string_view>
 
 namespace rag {
+namespace {
+
+void appendDocxLayout(std::string& layout, const DocxPosition& position, std::size_t textBytes) {
+    layout += std::to_string(position.part.size()) + ':' + position.part + ':';
+    if (const auto* paragraph = std::get_if<std::size_t>(&position.anchor)) {
+        layout += "p" + std::to_string(*paragraph) + ':';
+    } else {
+        const auto& cell = std::get<TableCell>(position.anchor);
+        layout += "t" + std::to_string(cell.table) + ',' + std::to_string(cell.row) + ',' +
+                  std::to_string(cell.cell) + ':';
+    }
+    layout += std::to_string(textBytes) + ';';
+}
+
+}  // namespace
 
 Result<ImportReport> IndexingService::import(const std::filesystem::path& path) {
     auto file = reader_.read(path);
@@ -12,17 +27,32 @@ Result<ImportReport> IndexingService::import(const std::filesystem::path& path) 
     }
 
     std::string content;
-    std::string pageLayout;
+    auto& extracted = std::get<ExtractedDocument>(file);
+    const bool isDocx = !extracted.sections.empty() && extracted.sections.front().docx.has_value();
+    std::string positionLayout;
     std::vector<DocumentLine> lines;
     std::vector<std::size_t> pagesWithoutText;
     std::size_t line = 1;
-    for (const auto& section : std::get<std::vector<TextSection>>(file)) {
+    for (auto& section : extracted.sections) {
+        if (section.docx) {
+            if (positionLayout.empty()) {
+                positionLayout = "docx:";
+            } else {
+                content += '\n';
+            }
+            appendDocxLayout(positionLayout, *section.docx, section.text.size());
+            content += section.text;
+            if (section.text.find_first_not_of(" \t\r\n\f\v") != std::string::npos) {
+                lines.push_back({line++, std::move(section.text), {}, std::move(section.docx)});
+            }
+            continue;
+        }
         if (section.page) {
-            if (!pageLayout.empty()) {
+            if (!positionLayout.empty()) {
                 content += '\n';
             }
             // Page lengths distinguish PDF page boundaries even when the joined text is identical.
-            pageLayout += std::to_string(section.text.size()) + ',';
+            positionLayout += std::to_string(section.text.size()) + ',';
         }
         content += section.text;
 
@@ -47,16 +77,19 @@ Result<ImportReport> IndexingService::import(const std::filesystem::path& path) 
     }
 
     if (lines.empty()) {
-        return pageLayout.empty() ? AppError::EmptyDocument : AppError::PdfNoText;
+        if (isDocx) {
+            return AppError::DocxNoText;
+        }
+        return positionLayout.empty() ? AppError::EmptyDocument : AppError::PdfNoText;
     }
 
     const auto filename = path.filename().u8string();
     const auto saved = store_.save(std::string(filename.begin(), filename.end()), std::move(content),
-                                  std::move(lines), DocumentPolicy::LocalOnly, std::move(pageLayout));
+                                  std::move(lines), DocumentPolicy::LocalOnly, std::move(positionLayout));
     if (const auto* error = std::get_if<AppError>(&saved)) {
         return *error;
     }
-    return ImportReport{std::get<std::size_t>(saved), std::move(pagesWithoutText)};
+    return ImportReport{std::get<std::size_t>(saved), std::move(pagesWithoutText), extracted.incomplete};
 }
 
 Result<Answer> RagService::ask(std::string text) {
@@ -89,7 +122,8 @@ Result<Answer> RagService::ask(std::string text) {
     const auto& citation = std::get<ProposedCitation>(proposed);
     const auto match = std::ranges::find_if(evidence, [&](const Chunk& chunk) {
         return chunk.documentId() == citation.documentId && chunk.line() == citation.line &&
-               chunk.page() == citation.page && chunk.text() == citation.quote;
+               chunk.page() == citation.page && chunk.docx() == citation.docx &&
+               chunk.text() == citation.quote;
     });
     if (match == evidence.end()) {
         return AppError::InvalidCitation;

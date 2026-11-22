@@ -8,11 +8,11 @@ namespace rag {
 std::string_view describeError(AppError error) {
     switch (error) {
     case AppError::UnsupportedFormat:
-        return "Выберите файл с расширением .txt или .pdf.";
+        return "Выберите файл с расширением .txt, .pdf или .docx.";
     case AppError::FileUnavailable:
         return "Не удалось открыть или прочитать файл.";
     case AppError::FileTooLarge:
-        return "Файл превышает допустимый размер (TXT — 8 МиБ, PDF — 64 МиБ).";
+        return "Файл превышает допустимый размер (TXT — 8 МиБ, PDF и DOCX — 64 МиБ).";
     case AppError::InvalidEncoding:
         return "Не удалось прочитать кодировку. Сохраните файл в UTF-8.";
     case AppError::EmptyDocument:
@@ -41,6 +41,12 @@ std::string_view describeError(AppError error) {
         return "В PDF нет текстового слоя, доступного для поиска.";
     case AppError::PdfTextTooLarge:
         return "Объём извлечённого текста PDF превышает 32 МиБ.";
+    case AppError::DocxCorrupt:
+        return "DOCX повреждён или содержит некорректную структуру ZIP или XML.";
+    case AppError::DocxNoText:
+        return "В поддерживаемых частях DOCX нет текста для поиска.";
+    case AppError::DocxLimitExceeded:
+        return "DOCX превышает ограничение распаковки или структуры XML.";
     }
     return "Не удалось выполнить запрос.";
 }
@@ -54,15 +60,23 @@ int runCli(IndexingService& index, RagService& rag, std::span<const std::filesys
             const auto path = file.u8string();
             errors << std::string(path.begin(), path.end()) << ": " << describeError(*error) << '\n';
             ++failedImports;
-        } else if (const auto& pages = std::get<ImportReport>(imported).pagesWithoutText; !pages.empty()) {
+            continue;
+        }
+        const auto& report = std::get<ImportReport>(imported);
+        if (!report.pagesWithoutText.empty()) {
             const auto path = file.u8string();
             errors << std::string(path.begin(), path.end()) << ": страницы без текста — ";
             const char* separator = "";
-            for (const auto page : pages) {
+            for (const auto page : report.pagesWithoutText) {
                 errors << separator << page;
                 separator = ", ";
             }
             errors << ". Остальной текст проиндексирован.\n";
+        }
+        if (report.incomplete) {
+            const auto path = file.u8string();
+            errors << std::string(path.begin(), path.end())
+                   << ": DOCX извлечён частично. Неподдерживаемые элементы пропущены.\n";
         }
     }
     if (!files.empty() && failedImports == files.size()) {
@@ -85,7 +99,15 @@ int runCli(IndexingService& index, RagService& rag, std::span<const std::filesys
     output << "Найденный фрагмент (тестовый провайдер)\n"
            << "«" << citation->quote() << "»\n"
            << "Источник: " << citation->source();
-    if (const auto page = citation->page()) {
+    if (const auto& docx = citation->docx()) {
+        output << ", часть " << docx->part;
+        if (const auto* paragraph = std::get_if<std::size_t>(&docx->anchor)) {
+            output << ", абзац " << *paragraph;
+        } else {
+            const auto& cell = std::get<TableCell>(docx->anchor);
+            output << ", таблица " << cell.table << ", строка " << cell.row << ", ячейка " << cell.cell;
+        }
+    } else if (const auto page = citation->page()) {
         output << ", страница " << *page;
     } else {
         output << ", строка " << citation->line();

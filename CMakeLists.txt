@@ -57,6 +57,38 @@ set_target_properties(rag_pdfium PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${pdfium_binary_SOURCE_DIR}/include"
 )
 
+set(RAG_MINIZ_ARCHIVE "" CACHE FILEPATH "Path to miniz-3.1.2.zip")
+set(RAG_PUGIXML_ARCHIVE "" CACHE FILEPATH "Path to pugixml-1.16.tar.gz")
+set(miniz_url "https://github.com/richgel999/miniz/releases/download/3.1.2/miniz-3.1.2.zip")
+set(pugixml_url "https://github.com/zeux/pugixml/releases/download/v1.16/pugixml-1.16.tar.gz")
+if(RAG_MINIZ_ARCHIVE)
+    set(miniz_url "${RAG_MINIZ_ARCHIVE}")
+endif()
+if(RAG_PUGIXML_ARCHIVE)
+    set(pugixml_url "${RAG_PUGIXML_ARCHIVE}")
+endif()
+FetchContent_Declare(miniz_sources
+    URL "${miniz_url}"
+    URL_HASH SHA256=f0446d863f9c19926ad9483c523fdc42e42b8d4a6a431d27e09d49c79a140d9a
+    TLS_VERIFY ON
+    TIMEOUT 60
+)
+FetchContent_Declare(pugixml_sources
+    URL "${pugixml_url}"
+    URL_HASH SHA256=4cee1ca4aad395170f4c7a07824f3bdd41f28316c6e1e1090a1425b278ec0b4b
+    TLS_VERIFY ON
+    TIMEOUT 60
+    SOURCE_SUBDIR unused
+)
+FetchContent_MakeAvailable(miniz_sources pugixml_sources)
+
+add_library(rag_miniz STATIC "${miniz_sources_SOURCE_DIR}/miniz.c")
+target_include_directories(rag_miniz SYSTEM PUBLIC "${miniz_sources_SOURCE_DIR}")
+target_compile_definitions(rag_miniz PUBLIC MINIZ_NO_STDIO MINIZ_NO_ARCHIVE_WRITING_APIS)
+add_library(rag_pugixml STATIC "${pugixml_sources_SOURCE_DIR}/src/pugixml.cpp")
+target_include_directories(rag_pugixml SYSTEM PUBLIC "${pugixml_sources_SOURCE_DIR}/src")
+target_compile_definitions(rag_pugixml PUBLIC PUGIXML_NO_XPATH)
+
 add_library(rag_domain INTERFACE)
 target_include_directories(rag_domain INTERFACE include)
 target_compile_features(rag_domain INTERFACE cxx_std_20)
@@ -67,12 +99,14 @@ target_link_libraries(rag_application PUBLIC rag_domain)
 add_library(rag_infrastructure
     src/infrastructure/txt_reader.cpp
     src/infrastructure/pdf_reader.cpp
+    src/infrastructure/docx_reader.cpp
     src/infrastructure/local_file.cpp
     src/infrastructure/keyword_retriever.cpp
     src/infrastructure/sqlite_knowledge_store.cpp
     src/infrastructure/utf8.cpp
 )
-target_link_libraries(rag_infrastructure PUBLIC rag_application PRIVATE rag_sqlite rag_pdfium)
+target_link_libraries(rag_infrastructure PUBLIC rag_application
+    PRIVATE rag_sqlite rag_pdfium rag_miniz rag_pugixml)
 
 add_executable(rag_cli apps/main.cpp src/presentation/cli.cpp)
 target_link_libraries(rag_cli PRIVATE rag_application rag_infrastructure)
@@ -95,7 +129,7 @@ if(BUILD_TESTING)
     endforeach()
     add_executable(rag_sqlite_tests tests/sqlite_tests.cpp)
     target_link_libraries(rag_sqlite_tests PRIVATE rag_infrastructure rag_sqlite)
-    foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure)
+    foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure migration_v2)
         add_test(NAME sqlite_${case}
                  COMMAND rag_sqlite_tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
                          "${CMAKE_CURRENT_BINARY_DIR}")
@@ -124,5 +158,12 @@ if(BUILD_TESTING)
                          "-DFIXTURES=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
                          "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
                          -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_pdf.cmake")
+    endforeach()
+    foreach(case IN ITEMS mixed_persistence parts errors limits visible_text)
+        add_test(NAME cli_docx_${case}
+                 COMMAND "${CMAKE_COMMAND}" "-DCLI=$<TARGET_FILE:rag_cli>"
+                         "-DCASE=${case}" "-DDEMO_DIR=${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
+                         "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_docx.cmake")
     endforeach()
 endif()

@@ -73,7 +73,7 @@ Result<std::string> extractPage(FPDF_DOCUMENT document, int pageIndex, std::size
 
 }  // namespace
 
-Result<std::vector<TextSection>> PdfReader::read(const std::filesystem::path& path) const {
+Result<ExtractedDocument> PdfReader::read(const std::filesystem::path& path) const {
     if (!hasExtension(path, L".pdf")) {
         return AppError::UnsupportedFormat;
     }
@@ -111,7 +111,7 @@ Result<std::vector<TextSection>> PdfReader::read(const std::filesystem::path& pa
         remainingBytes -= text.size();
         sections.push_back({std::move(text), static_cast<std::size_t>(index) + 1});
     }
-    return sections;
+    return ExtractedDocument{std::move(sections)};
 }
 
 }  // namespace rag

@@ -40,8 +40,8 @@ public:
 
 class PagedReader final : public IDocumentReader {
 public:
-    Result<std::vector<TextSection>> read(const std::filesystem::path&) const override {
-        return std::vector<TextSection>{{"", 1}, {"Orion snapshot.", 2}};
+    Result<ExtractedDocument> read(const std::filesystem::path&) const override {
+        return ExtractedDocument{{{"", 1}, {"Orion snapshot.", 2}}};
     }
 };
 
@@ -78,9 +78,9 @@ bool encodings(const std::filesystem::path& buildDir) {
             return false;
         }
         const auto content = reader.read(path);
-        const auto* sections = std::get_if<std::vector<TextSection>>(&content);
-        if (!expect(sections && sections->size() == 1 && sections->front().text == "A" &&
-                        !sections->front().page,
+        const auto* document = std::get_if<ExtractedDocument>(&content);
+        if (!expect(document && document->sections.size() == 1 &&
+                        document->sections.front().text == "A" && !document->sections.front().page,
                     "BOM and encoding must be handled without assigning a page to TXT")) {
             return false;
         }

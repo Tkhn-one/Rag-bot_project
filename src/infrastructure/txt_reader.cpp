@@ -38,7 +38,7 @@ std::optional<std::string> decodeTxt(std::string bytes) {
 
 }  // namespace
 
-Result<std::vector<TextSection>> TxtReader::read(const std::filesystem::path& path) const {
+Result<ExtractedDocument> TxtReader::read(const std::filesystem::path& path) const {
     if (!hasExtension(path, L".txt")) {
         return AppError::UnsupportedFormat;
     }
@@ -53,7 +53,7 @@ Result<std::vector<TextSection>> TxtReader::read(const std::filesystem::path& pa
     }
     std::vector<TextSection> sections;
     sections.push_back({std::move(*text)});
-    return sections;
+    return ExtractedDocument{std::move(sections)};
 }
 
 }  // namespace rag

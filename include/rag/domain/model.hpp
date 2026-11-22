@@ -25,7 +25,10 @@ enum class AppError {
     PdfCorrupt,
     PdfEncrypted,
     PdfNoText,
-    PdfTextTooLarge
+    PdfTextTooLarge,
+    DocxCorrupt,
+    DocxNoText,
+    DocxLimitExceeded
 };
 
 template <typename T>
@@ -35,15 +38,30 @@ using DocumentId = std::size_t;
 
 enum class DocumentPolicy { LocalOnly, AllowRemote };
 
+struct TableCell {
+    std::size_t table, row, cell;
+
+    bool operator==(const TableCell&) const = default;
+};
+
+struct DocxPosition {
+    std::string part;
+    std::variant<std::size_t, TableCell> anchor;
+
+    bool operator==(const DocxPosition&) const = default;
+};
+
 class Chunk {
 public:
     Chunk(DocumentId documentId, std::size_t line, std::string text,
-          std::optional<std::size_t> page = {})
-        : documentId_(documentId), line_(line), text_(std::move(text)), page_(page) {}
+          std::optional<std::size_t> page = {}, std::optional<DocxPosition> docx = {})
+        : documentId_(documentId), line_(line), text_(std::move(text)), page_(page),
+          docx_(std::move(docx)) {}
 
     DocumentId documentId() const noexcept { return documentId_; }
     std::size_t line() const noexcept { return line_; }
     std::optional<std::size_t> page() const noexcept { return page_; }
+    const std::optional<DocxPosition>& docx() const noexcept { return docx_; }
     const std::string& text() const noexcept { return text_; }
 
 private:
@@ -51,6 +69,7 @@ private:
     std::size_t line_;
     std::string text_;
     std::optional<std::size_t> page_;
+    std::optional<DocxPosition> docx_;
 };
 
 class Question {
@@ -80,6 +99,7 @@ public:
     DocumentId documentId() const noexcept { return chunk_.documentId(); }
     std::size_t line() const noexcept { return chunk_.line(); }
     std::optional<std::size_t> page() const noexcept { return chunk_.page(); }
+    const std::optional<DocxPosition>& docx() const noexcept { return chunk_.docx(); }
     const std::string& quote() const noexcept { return chunk_.text(); }
 
 private:

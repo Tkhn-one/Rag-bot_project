@@ -7,6 +7,7 @@ namespace rag {
 struct ImportReport {
     std::size_t chunks;
     std::vector<std::size_t> pagesWithoutText;
+    bool incomplete;
 };
 
 class IndexingService {

@@ -12,27 +12,34 @@ struct DocumentLine {
     std::size_t number;
     std::string text;
     std::optional<std::size_t> page = {};
+    std::optional<DocxPosition> docx = {};
 };
 
 struct TextSection {
     std::string text;
     std::optional<std::size_t> page = {};
+    std::optional<DocxPosition> docx = {};
+};
+
+struct ExtractedDocument {
+    std::vector<TextSection> sections;
+    bool incomplete = false;
 };
 
 class IndexedDocument {
 public:
     IndexedDocument(DocumentId id, std::string source, std::string content,
                     std::vector<Chunk> chunks, DocumentPolicy policy = DocumentPolicy::LocalOnly,
-                    std::string pageLayout = {})
+                    std::string positionLayout = {})
         : id_(id), source_(std::move(source)), content_(std::move(content)),
-          chunks_(std::move(chunks)), policy_(policy), pageLayout_(std::move(pageLayout)) {}
+          chunks_(std::move(chunks)), policy_(policy), positionLayout_(std::move(positionLayout)) {}
 
     DocumentId id() const noexcept { return id_; }
     const std::string& source() const noexcept { return source_; }
     const std::string& content() const noexcept { return content_; }
     std::span<const Chunk> chunks() const noexcept { return chunks_; }
     DocumentPolicy policy() const noexcept { return policy_; }
-    const std::string& pageLayout() const noexcept { return pageLayout_; }
+    const std::string& positionLayout() const noexcept { return positionLayout_; }
 
 private:
     DocumentId id_;
@@ -40,14 +47,14 @@ private:
     std::string content_;
     std::vector<Chunk> chunks_;
     DocumentPolicy policy_;
-    std::string pageLayout_;
+    std::string positionLayout_;
 };
 
 class IDocumentReader {
 public:
     virtual ~IDocumentReader() = default;
-    // TXT returns one unnumbered section. Paginated readers return every page in order.
-    virtual Result<std::vector<TextSection>> read(const std::filesystem::path& path) const = 0;
+    // TXT returns one unnumbered section. PDF returns pages; DOCX returns located blocks.
+    virtual Result<ExtractedDocument> read(const std::filesystem::path& path) const = 0;
 };
 
 class IKnowledgeStore {
@@ -55,10 +62,10 @@ public:
     virtual ~IKnowledgeStore() = default;
 
     // Publish the document and its lines together. Line numbers must be positive and unique.
-    // Page layout is empty for TXT. For equal content and layout, return the existing chunk count.
+    // Position layout is empty for TXT. For equal text and layout, return the existing chunk count.
     virtual Result<std::size_t> save(std::string source, std::string content,
                                      std::vector<DocumentLine> lines, DocumentPolicy policy,
-                                     std::string pageLayout = {}) = 0;
+                                     std::string positionLayout = {}) = 0;
 
     // Return an owning snapshot ordered by document ID and line number.
     virtual Result<std::vector<IndexedDocument>> documents() const = 0;
@@ -76,6 +83,7 @@ struct ProposedCitation {
     std::string quote;
     DocumentId documentId = 0;
     std::optional<std::size_t> page = {};
+    std::optional<DocxPosition> docx = {};
 };
 
 class ILlmProvider {

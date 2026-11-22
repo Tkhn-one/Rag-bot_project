@@ -129,7 +129,7 @@ void reopen(const fs::path& directory, const fs::path& demo) {
     const auto path = directory / L"библиотека с пробелами.sqlite";
     const auto decisions = demo / "decisions.txt";
     const TxtReader reader;
-    const auto content = requireValue(reader.read(decisions), "decoding demo TXT").front().text;
+    const auto content = requireValue(reader.read(decisions), "decoding demo TXT").sections.front().text;
     DocumentId decisionsId = 0;
     {
         auto store = openStore(path);
@@ -283,7 +283,7 @@ void migrate(const fs::path& directory) {
     createLegacyLibrary(path);
     const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 2, "opened database must advance to v2");
+    require(fixtureScalar(path, "PRAGMA user_version") == 3, "opened database must advance to v3");
     require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
                 fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
             "backup must retain the v1 schema, document ID and line");
@@ -295,7 +295,7 @@ void migrate(const fs::path& directory) {
     requireCitation(*store, decisionsQuestion, 42, "decisions.txt", decisionsQuote);
     requireCitation(*openStore(path), decisionsQuestion, 42, "decisions.txt", decisionsQuote);
     require(!fs::exists(directory / "legacy.sqlite.v1-backup-1"),
-            "reopening v2 must not repeat the migration");
+            "reopening v3 must not repeat the migration");
 }
 
 void migrationFailure(const fs::path& directory) {
@@ -316,6 +316,45 @@ void migrationFailure(const fs::path& directory) {
     requireCitation(*openStore(path), decisionsQuestion, 42, "decisions.txt", decisionsQuote);
     require(fixtureScalar(backup, "SELECT count(*) FROM sqlite_schema WHERE name = 'chunks_v1'") == 1,
             "retry must not overwrite the original v1 backup");
+}
+
+void migratePdfEra(const fs::path& directory) {
+    const auto path = directory / "pdf-era.sqlite";
+    executeFixtureSql(path, R"sql(
+        CREATE TABLE documents (
+            id INTEGER PRIMARY KEY, source TEXT NOT NULL, content TEXT NOT NULL COLLATE BINARY,
+            policy INTEGER NOT NULL CHECK (policy IN (0, 1)), page_layout TEXT NOT NULL,
+            UNIQUE (content, page_layout)
+        ) STRICT;
+        CREATE TABLE chunks (
+            document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            line INTEGER NOT NULL CHECK (line > 0), text TEXT NOT NULL, page INTEGER CHECK (page > 0),
+            PRIMARY KEY (document_id, line)
+        ) STRICT, WITHOUT ROWID;
+        PRAGMA application_id = 0x52414742;
+        PRAGMA user_version = 2;
+        INSERT INTO documents VALUES
+            (7, 'decisions.txt', 'Резервное копирование выполняется каждую пятницу.', 1, ''),
+            (42, 'protocol.pdf', 'Orion snapshot runs every Friday.', 0, '0,33,');
+        INSERT INTO chunks VALUES
+            (7, 4, 'Резервное копирование выполняется каждую пятницу.', NULL),
+            (42, 1, 'Orion snapshot runs every Friday.', 2);
+    )sql");
+    const auto store = openStore(path);
+    require(fixtureScalar(path, "PRAGMA user_version") == 3, "v2 must advance to v3");
+    const auto backup = directory / "pdf-era.sqlite.v2-backup" / "library.sqlite";
+    require(fixtureScalar(backup, "PRAGMA user_version") == 2 &&
+                fixtureScalar(backup, "SELECT page FROM chunks WHERE document_id = 42") == 2,
+            "v2 backup must preserve the PDF page and document ID");
+    requireCitation(*store, decisionsQuestion, 7, "decisions.txt", decisionsQuote);
+    const KeywordRetriever retriever;
+    MockProvider provider;
+    RagService service(*store, retriever, provider);
+    const auto pdf = requireValue(service.ask("Orion"), "reading migrated PDF");
+    require(pdf.citation() && pdf.citation()->documentId() == 42 &&
+                pdf.citation()->source() == "protocol.pdf" && pdf.citation()->page() == 2 &&
+                !pdf.citation()->docx() && pdf.citation()->quote() == "Orion snapshot runs every Friday.",
+            "migration must preserve PDF citation, page and ID");
 }
 
 }  // namespace
@@ -339,6 +378,8 @@ int wmain(int argc, wchar_t* argv[]) {
             migrate(directory.path());
         } else if (test == L"migration_failure") {
             migrationFailure(directory.path());
+        } else if (test == L"migration_v2") {
+            migratePdfEra(directory.path());
         } else {
             return 2;
         }
