@@ -8,6 +8,11 @@
 
 namespace rag {
 
+struct DocumentLine {
+    std::size_t number;
+    std::string text;
+};
+
 class IndexedDocument {
 public:
     IndexedDocument(DocumentId id, std::string source, std::string content,
@@ -38,8 +43,14 @@ public:
 class IKnowledgeStore {
 public:
     virtual ~IKnowledgeStore() = default;
-    virtual void append(IndexedDocument document) = 0;
-    virtual std::span<const IndexedDocument> documents() const noexcept = 0;
+
+    // Publish the document and its lines together. Line numbers must be positive and unique.
+    // For identical decoded content, keep the existing record. Return the stored chunk count.
+    virtual Result<std::size_t> save(std::string source, std::string content,
+                                     std::vector<DocumentLine> lines, DocumentPolicy policy) = 0;
+
+    // Return an owning snapshot ordered by document ID and line number.
+    virtual Result<std::vector<IndexedDocument>> documents() const = 0;
 };
 
 class IRetriever {

@@ -2,12 +2,10 @@
 #include "rag/application/services.hpp"
 
 #include <ostream>
-#include <string_view>
 
 namespace rag {
-namespace {
 
-std::string_view describe(AppError error) {
+std::string_view describeError(AppError error) {
     switch (error) {
     case AppError::UnsupportedFormat:
         return "Выберите файл с расширением .txt.";
@@ -23,11 +21,19 @@ std::string_view describe(AppError error) {
         return "Введите вопрос.";
     case AppError::InvalidCitation:
         return "Тестовый провайдер вернул неподтверждённую цитату.";
+    case AppError::StoreReadFailed:
+        return "Не удалось прочитать библиотеку документов.";
+    case AppError::StoreWriteFailed:
+        return "Не удалось сохранить документ в библиотеке.";
+    case AppError::StoreUnavailable:
+        return "Не удалось открыть базу SQLite. Проверьте путь и права доступа.";
+    case AppError::StoreCorrupt:
+        return "Файл базы SQLite повреждён или имеет неверный формат.";
+    case AppError::StoreSchemaUnsupported:
+        return "Файл использует неподдерживаемую схему библиотеки.";
     }
     return "Не удалось выполнить запрос.";
 }
-
-}  // namespace
 
 int runCli(IndexingService& index, RagService& rag, std::span<const std::filesystem::path> files,
            std::string question, std::ostream& output, std::ostream& errors) {
@@ -36,18 +42,18 @@ int runCli(IndexingService& index, RagService& rag, std::span<const std::filesys
         const auto imported = index.import(file);
         if (const auto* error = std::get_if<AppError>(&imported)) {
             const auto path = file.u8string();
-            errors << std::string(path.begin(), path.end()) << ": " << describe(*error) << '\n';
+            errors << std::string(path.begin(), path.end()) << ": " << describeError(*error) << '\n';
             ++failedImports;
         }
     }
-    if (failedImports == files.size()) {
+    if (!files.empty() && failedImports == files.size()) {
         return 1;
     }
 
     const int status = failedImports == 0 ? 0 : 1;
     const auto result = rag.ask(std::move(question));
     if (const auto* error = std::get_if<AppError>(&result)) {
-        errors << describe(*error) << '\n';
+        errors << describeError(*error) << '\n';
         return 1;
     }
 

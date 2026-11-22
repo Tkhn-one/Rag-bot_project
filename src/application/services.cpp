@@ -12,21 +12,13 @@ Result<std::size_t> IndexingService::import(const std::filesystem::path& path) {
     }
 
     auto& content = std::get<std::string>(file);
-    const auto documents = store_.documents();
-    const auto duplicate = std::ranges::find(documents, content, &IndexedDocument::content);
-    if (duplicate != documents.end()) {
-        return duplicate->chunks().size();
-    }
-
-    // Imports append complete documents in this in-memory library.
-    const DocumentId id = documents.size() + 1;
-    std::vector<Chunk> chunks;
+    std::vector<DocumentLine> lines;
     std::string_view remaining = content;
     for (std::size_t line = 1; !remaining.empty(); ++line) {
         const auto end = remaining.find_first_of("\r\n");
         const auto text = remaining.substr(0, end);
         if (text.find_first_not_of(" \t\f\v") != std::string_view::npos) {
-            chunks.emplace_back(id, line, std::string(text));
+            lines.push_back({line, std::string(text)});
         }
         if (end == std::string_view::npos) {
             break;
@@ -35,15 +27,13 @@ Result<std::size_t> IndexingService::import(const std::filesystem::path& path) {
         remaining.remove_prefix(end + (crlf ? 2 : 1));
     }
 
-    if (chunks.empty()) {
+    if (lines.empty()) {
         return AppError::EmptyDocument;
     }
 
     const auto filename = path.filename().u8string();
-    const auto count = chunks.size();
-    store_.append(IndexedDocument(id, std::string(filename.begin(), filename.end()),
-                                 std::move(content), std::move(chunks)));
-    return count;
+    return store_.save(std::string(filename.begin(), filename.end()), std::move(content),
+                       std::move(lines), DocumentPolicy::LocalOnly);
 }
 
 Result<Answer> RagService::ask(std::string text) {
@@ -52,7 +42,12 @@ Result<Answer> RagService::ask(std::string text) {
         return *error;
     }
 
-    const auto documents = store_.documents();
+    const auto snapshot = store_.documents();
+    if (const auto* error = std::get_if<AppError>(&snapshot)) {
+        return *error;
+    }
+
+    const auto& documents = std::get<std::vector<IndexedDocument>>(snapshot);
     if (documents.empty()) {
         return Answer{};
     }

@@ -15,7 +15,12 @@ enum class AppError {
     InvalidEncoding,
     EmptyDocument,
     EmptyQuestion,
-    InvalidCitation
+    InvalidCitation,
+    StoreReadFailed,
+    StoreWriteFailed,
+    StoreUnavailable,
+    StoreCorrupt,
+    StoreSchemaUnsupported
 };
 
 template <typename T>

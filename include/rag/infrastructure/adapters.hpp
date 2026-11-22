@@ -2,6 +2,8 @@
 
 #include "rag/application/ports.hpp"
 
+#include <algorithm>
+
 namespace rag {
 
 class TxtReader final : public IDocumentReader {
@@ -11,16 +13,33 @@ public:
 
 class InMemoryKnowledgeStore final : public IKnowledgeStore {
 public:
-    void append(IndexedDocument document) override {
-        documents_.push_back(std::move(document));
+    Result<std::size_t> save(std::string source, std::string content,
+                             std::vector<DocumentLine> lines, DocumentPolicy policy) override {
+        if (lines.empty()) {
+            return AppError::StoreWriteFailed;
+        }
+        const auto duplicate = std::ranges::find(documents_, content, &IndexedDocument::content);
+        if (duplicate != documents_.end()) {
+            return duplicate->chunks().size();
+        }
+
+        std::ranges::sort(lines, {}, &DocumentLine::number);
+        if (lines.front().number == 0 ||
+            std::ranges::adjacent_find(lines, {}, &DocumentLine::number) != lines.end()) {
+            return AppError::StoreWriteFailed;
+        }
+        const DocumentId id = documents_.size() + 1;
+        std::vector<Chunk> chunks;
+        chunks.reserve(lines.size());
+        for (auto& line : lines) {
+            chunks.emplace_back(id, line.number, std::move(line.text));
+        }
+        documents_.emplace_back(id, std::move(source), std::move(content), std::move(chunks), policy);
+        return lines.size();
     }
 
-    std::span<const IndexedDocument> documents() const noexcept override {
+    Result<std::vector<IndexedDocument>> documents() const override {
         return documents_;
-    }
-
-    const IndexedDocument* current() const noexcept {
-        return documents_.empty() ? nullptr : &documents_.back();
     }
 
 private:

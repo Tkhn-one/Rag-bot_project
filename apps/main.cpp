@@ -1,5 +1,6 @@
 #include "rag/application/services.hpp"
 #include "rag/infrastructure/adapters.hpp"
+#include "rag/infrastructure/sqlite_knowledge_store.hpp"
 #include "rag/infrastructure/utf8.hpp"
 #include "rag/presentation/cli.hpp"
 
@@ -9,7 +10,9 @@
 
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -35,9 +38,13 @@ void print(DWORD handleId, std::ostream& stream, const std::string& utf8) {
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
-    if (argc < 3) {
+    const bool useDatabase = argc > 1 && std::wstring_view(argv[1]) == L"--db";
+    const int firstFile = useDatabase ? 3 : 1;
+    const int minimumArguments = useDatabase ? 4 : 3;
+    if (argc < minimumArguments) {
         print(STD_ERROR_HANDLE, std::cerr,
-              "Использование: rag_cli <файл.txt> [<ещё-файл.txt> ...] \"<вопрос>\"\n");
+              "Использование: rag_cli <файл.txt> [<ещё-файл.txt> ...] \"<вопрос>\"\n"
+              "               rag_cli --db <путь-к-базе> [<файл.txt> ...] \"<вопрос>\"\n");
         return 2;
     }
 
@@ -47,14 +54,25 @@ int wmain(int argc, wchar_t* argv[]) {
         return 2;
     }
 
+    std::unique_ptr<rag::IKnowledgeStore> store;
+    if (useDatabase) {
+        auto opened = rag::SqliteKnowledgeStore::open(argv[2]);
+        if (const auto* error = std::get_if<rag::AppError>(&opened)) {
+            print(STD_ERROR_HANDLE, std::cerr, std::string(rag::describeError(*error)) + '\n');
+            return 1;
+        }
+        store = std::get<std::unique_ptr<rag::SqliteKnowledgeStore>>(std::move(opened));
+    } else {
+        store = std::make_unique<rag::InMemoryKnowledgeStore>();
+    }
+
     const rag::TxtReader reader;
-    rag::InMemoryKnowledgeStore store;
     const rag::KeywordRetriever retriever;
     rag::MockProvider provider;
-    rag::IndexingService index(reader, store);
-    rag::RagService service(store, retriever, provider);
+    rag::IndexingService index(reader, *store);
+    rag::RagService service(*store, retriever, provider);
 
-    const std::vector<std::filesystem::path> files(argv + 1, argv + argc - 1);
+    const std::vector<std::filesystem::path> files(argv + firstFile, argv + argc - 1);
     std::ostringstream output;
     std::ostringstream errors;
     const auto status = rag::runCli(index, service, files, *question, output, errors);

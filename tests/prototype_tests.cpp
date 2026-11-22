@@ -26,6 +26,18 @@ private:
     int calls_ = 0;
 };
 
+class FailingKnowledgeStore final : public IKnowledgeStore {
+public:
+    Result<std::size_t> save(std::string, std::string, std::vector<DocumentLine>,
+                             DocumentPolicy) override {
+        return AppError::StoreWriteFailed;
+    }
+
+    Result<std::vector<IndexedDocument>> documents() const override {
+        return AppError::StoreReadFailed;
+    }
+};
+
 bool expect(bool condition, std::string_view message) {
     if (!condition) {
         std::cerr << message << '\n';
@@ -83,10 +95,15 @@ bool cites(const Result<Answer>& result, DocumentId id, std::string_view source,
            answer->citation()->quote() == quote;
 }
 
-bool duplicateImport(IndexingService& index, const InMemoryKnowledgeStore& store,
+std::vector<IndexedDocument> storedDocuments(const InMemoryKnowledgeStore& store) {
+    return std::get<std::vector<IndexedDocument>>(store.documents());
+}
+
+bool duplicateImport(IndexingService& index, InMemoryKnowledgeStore& store,
                      const std::filesystem::path& demo, const std::filesystem::path& buildDir) {
     const auto copy = buildDir / "duplicate_import.txt";
-    const auto& first = store.documents().front();
+    const auto initial = storedDocuments(store);
+    const auto& first = initial.front();
     const auto id = first.id();
     const auto chunks = first.chunks().size();
     if (!expect(writeFixture(copy, "\xEF\xBB\xBF" + first.content()),
@@ -94,12 +111,18 @@ bool duplicateImport(IndexingService& index, const InMemoryKnowledgeStore& store
         return false;
     }
 
-    return expect(index.import(demo) == Result<std::size_t>(chunks) &&
-                      index.import(copy) == Result<std::size_t>(chunks),
-                  "reimporting known content must succeed") &&
-           expect(store.documents().size() == 1 && store.documents().front().id() == id &&
-                      store.documents().front().source() == "contract.txt" &&
-                      store.documents().front().policy() == DocumentPolicy::LocalOnly,
+    if (!expect(index.import(demo) == Result<std::size_t>(chunks) &&
+                    index.import(copy) == Result<std::size_t>(chunks) &&
+                    store.save("remote.txt", first.content(), {{1, "Replacement"}},
+                               DocumentPolicy::AllowRemote) == Result<std::size_t>(chunks),
+                "reimporting known content must return the original chunk count")) {
+        return false;
+    }
+
+    const auto documents = storedDocuments(store);
+    return expect(documents.size() == 1 && documents.front().id() == id &&
+                      documents.front().source() == "contract.txt" &&
+                      documents.front().policy() == DocumentPolicy::LocalOnly,
                   "duplicates must preserve the original document identity, name and policy");
 }
 
@@ -110,10 +133,21 @@ bool run(std::string_view test, const std::filesystem::path& demo,
     }
 
     const TxtReader reader;
-    InMemoryKnowledgeStore store;
     const KeywordRetriever retriever;
-    IndexingService index(reader, store);
     ProbeProvider probe({4, "Выдуманная цитата."});
+    if (test == "store_errors") {
+        FailingKnowledgeStore store;
+        IndexingService index(reader, store);
+        RagService service(store, retriever, probe);
+        return expect(isError(index.import(demo), AppError::StoreWriteFailed),
+                      "the indexing service must propagate store write failures") &&
+               expect(isError(service.ask("срок приёмки"), AppError::StoreReadFailed) &&
+                          probe.calls() == 0,
+                      "the RAG service must propagate store read failures without generation");
+    }
+
+    InMemoryKnowledgeStore store;
+    IndexingService index(reader, store);
     RagService withProbe(store, retriever, probe);
 
     if (test == "empty_file") {
@@ -125,7 +159,7 @@ bool run(std::string_view test, const std::filesystem::path& demo,
         const auto result = withProbe.ask("срок");
         const auto* answer = std::get_if<Answer>(&result);
         return expect(isError(imported, AppError::EmptyDocument), "expected EmptyDocument") &&
-               expect(!store.current(), "failed import must not publish a document") &&
+               expect(storedDocuments(store).empty(), "failed import must not publish a document") &&
                expect(answer && !answer->citation() && probe.calls() == 0,
                       "asking against an empty store must skip generation");
     }
@@ -145,25 +179,33 @@ bool run(std::string_view test, const std::filesystem::path& demo,
     }
     if (test == "second_document" || test == "wrong_document_citation" ||
         test == "failed_import_preserves_library") {
-        const auto firstId = store.documents().front().id();
+        const auto firstId = storedDocuments(store).front().id();
         if (test == "failed_import_preserves_library") {
             const auto path = buildDir / "failed_import.txt";
             if (!expect(writeFixture(path, "Valid first line.\r\n\xC3\x28"),
                         "could not write malformed TXT") ||
-                !expect(isError(index.import(path), AppError::InvalidEncoding) &&
-                            store.documents().size() == 1 && store.documents().front().id() == firstId,
+                !expect(isError(index.import(path), AppError::InvalidEncoding),
+                        "malformed TXT must return InvalidEncoding")) {
+                return false;
+            }
+            const auto documents = storedDocuments(store);
+            if (!expect(documents.size() == 1 && documents.front().id() == firstId,
                         "failed import must leave the original library intact")) {
                 return false;
             }
         }
 
         const auto second = demo.parent_path() / "decisions.txt";
-        if (!expect(std::holds_alternative<std::size_t>(index.import(second)) &&
-                        store.documents().size() == 2,
+        if (!expect(std::holds_alternative<std::size_t>(index.import(second)),
+                    "the second document must import successfully")) {
+            return false;
+        }
+        const auto documents = storedDocuments(store);
+        if (!expect(documents.size() == 2,
                     "the library must contain both successful imports")) {
             return false;
         }
-        const auto& secondDocument = store.documents().back();
+        const auto& secondDocument = documents.back();
         const auto secondId = secondDocument.id();
         if (test == "wrong_document_citation") {
             for (const auto& proposal : {
@@ -216,7 +258,7 @@ bool run(std::string_view test, const std::filesystem::path& demo,
                expect(probe.calls() == 0, "no evidence must skip generation");
     }
     if (test == "unknown_citation") {
-        const auto documentId = store.documents().front().id();
+        const auto documentId = storedDocuments(store).front().id();
         ProbeProvider unknown({999, std::string(contractQuote), documentId});
         RagService service(store, retriever, unknown);
         return expect(isError(service.ask("срок приёмки"), AppError::InvalidCitation) &&
@@ -224,7 +266,7 @@ bool run(std::string_view test, const std::filesystem::path& demo,
                       "a citation with an unknown line must be rejected");
     }
     if (test == "altered_quote") {
-        const auto documentId = store.documents().front().id();
+        const auto documentId = storedDocuments(store).front().id();
         ProbeProvider altered({demoLine, "Выдуманная цитата.", documentId});
         RagService service(store, retriever, altered);
         return expect(isError(service.ask("срок приёмки"), AppError::InvalidCitation) &&
