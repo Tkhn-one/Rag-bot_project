@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace rag {
@@ -82,11 +83,27 @@ public:
     virtual Result<bool> setDocumentPolicy(DocumentId id, DocumentPolicy policy) = 0;
 };
 
+enum class EmbeddingInput { Document, Query };
+
+class IEmbeddingProvider {
+public:
+    virtual ~IEmbeddingProvider() = default;
+    virtual std::string profileId() const = 0;
+    virtual std::size_t dimension() const = 0;
+    virtual Result<std::vector<float>> embed(std::string_view text, EmbeddingInput input) const = 0;
+};
+
+struct SearchSettings {
+    int candidates = 20;
+    int rrfConstant = 60;
+    int contextLimit = 8;
+    int perDocument = 2;
+};
+
 class IRetriever {
 public:
     virtual ~IRetriever() = default;
-    virtual std::vector<Chunk> retrieve(const Question& question,
-                                        std::span<const IndexedDocument> documents) const = 0;
+    virtual Result<std::vector<Chunk>> retrieve(const Question& question, const LibrarySnapshot& library) const = 0;
 };
 
 struct ProposedCitation {

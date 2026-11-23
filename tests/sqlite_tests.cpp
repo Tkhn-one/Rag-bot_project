@@ -345,7 +345,7 @@ void migrate(const fs::path& directory) {
     createLegacyLibrary(path);
     const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 5, "opened database must advance to v5");
+    require(fixtureScalar(path, "PRAGMA user_version") == 6, "opened database must advance to v6");
     require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
                 fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
             "backup must retain the v1 schema, document ID and line");
@@ -403,7 +403,7 @@ void migratePdfEra(const fs::path& directory) {
             (42, 1, 'Orion snapshot runs every Friday.', 2);
     )sql");
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 5, "v2 must advance to v5");
+    require(fixtureScalar(path, "PRAGMA user_version") == 6, "v2 must advance to v6");
     const auto backup = directory / "pdf-era.sqlite.v2-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 2 &&
                 fixtureScalar(backup, "SELECT page FROM chunks WHERE document_id = 42") == 2,
@@ -444,7 +444,7 @@ void migrateDocxEra(const fs::path& directory) {
     const auto backup = directory / "docx-era.sqlite.v3-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 3 &&
                 fixtureScalar(backup, "SELECT docx_row FROM chunks WHERE document_id = 17 AND line = 2") == 2 &&
-                fixtureScalar(path, "PRAGMA user_version") == 5, "migration must preserve a readable v3 backup");
+                fixtureScalar(path, "PRAGMA user_version") == 6, "migration must preserve a readable v3 backup");
     const auto snapshot = requireValue(store->snapshot(), "reading migrated v3 library");
     require(snapshot.revision.number == 0 && snapshot.policy == DocumentPolicy::LocalOnly &&
                 snapshot.documents.size() == 1, "migration starts a closed library at its baseline revision");
@@ -461,7 +461,7 @@ void migrateDocxEra(const fs::path& directory) {
             "reopening must preserve the migrated identity without repeating the migration");
 }
 
-void migrateRevisionEra(const fs::path& directory, const fs::path& demo) {
+void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int version) {
     const auto path = directory / "revision-era.sqlite";
     IndexRevision previous;
     {
@@ -470,17 +470,40 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo) {
         IndexingService index(reader, *store);
         requireValue(index.import(demo / "decisions.txt"), "preparing a revisioned library");
         previous = requireValue(store->snapshot(), "reading the previous revision").revision;
+        if (version == 5) {
+            const KeywordRetriever keyword;
+            MockProvider mock;
+            ValidatingLlmProvider validated(mock);
+            CachingLlmProvider cached(validated, *store);
+            RagService oldService(*store, keyword, cached, store.get());
+            require(!requireValue(oldService.ask(decisionsQuestion), "seeding v5 cache and history").fromCache(),
+                    "old keyword profile must have its own completed answer");
+        }
     }
-    // V4 has exactly the same library, documents and chunks, without the two new tables.
-    executeFixtureSql(path, "DROP TABLE answer_cache; DROP TABLE history; PRAGMA user_version = 4");
+    executeFixtureSql(path, "DROP TRIGGER index_chunk; DROP TABLE chunks_fts; DROP TABLE embeddings; DROP TABLE search_profile");
+    executeFixtureSql(path, version == 4 ? "DROP TABLE answer_cache; DROP TABLE history; PRAGMA user_version = 4"
+                                         : "PRAGMA user_version = 5");
     const auto migrated = openStore(path);
-    const auto backup = directory / "revision-era.sqlite.v4-backup" / "library.sqlite";
-    require(fixtureScalar(backup, "PRAGMA user_version") == 4 &&
+    const auto backup = directory / ("revision-era.sqlite.v" + std::to_string(version) + "-backup") / "library.sqlite";
+    ++previous.number;  // Moving from KeywordRetriever to BM25 changes the index.
+    require(fixtureScalar(backup, "PRAGMA user_version") == version &&
                 fixtureScalar(backup, "SELECT count(*) FROM documents") == 1 &&
-                fixtureScalar(path, "PRAGMA user_version") == 5 &&
-                requireValue(migrated->snapshot(), "reading the migrated revision").revision == previous &&
-                requireValue(migrated->history(), "reading initial history").empty(),
-            "v4 migration must back up the database and preserve its existing identity and revision");
+                fixtureScalar(path, "PRAGMA user_version") == 6 &&
+                fixtureScalar(path, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'копирование'") == 1 &&
+                requireValue(migrated->snapshot(), "reading the migrated revision").revision == previous,
+            "migration must back up the database, populate FTS and publish a new revision");
+    const auto history = requireValue(migrated->history(), "checking migrated history");
+    if (version == 5) {
+        require(history.size() == 1 && history.front().outdated, "v5 history must survive as a previous revision");
+        MockProvider mock;
+        ValidatingLlmProvider validated(mock);
+        CachingLlmProvider cached(validated, *migrated);
+        RagService service(*migrated, *migrated, cached);
+        require(!requireValue(service.ask(decisionsQuestion), "first BM25 answer").fromCache(),
+                "schema migration must invalidate keyword-era answers");
+    } else {
+        require(history.empty(), "v4 must start with empty history");
+    }
     requireCitation(*migrated, decisionsQuestion, 1, "decisions.txt", decisionsQuote);
 }
 
@@ -627,6 +650,101 @@ void cacheAccessAndFailures(const fs::path& directory) {
                 probe.calls == 4 && cache.writes == 1, "only a validated retry may populate the cache");
 }
 
+class FixtureEmbeddings final : public IEmbeddingProvider {
+public:
+    std::string id = "fixture-v1";
+    bool fail = false;
+    std::string profileId() const override { return id; }
+    std::size_t dimension() const override { return 2; }
+    Result<std::vector<float>> embed(std::string_view text, EmbeddingInput) const override {
+        if (fail && text == "Archive") return AppError::EmbeddingFailed;
+        if (text == "Archive" || text == "restore point") return std::vector<float>{3, 0};
+        if (text == "needle" || text.ends_with(" C")) return std::vector<float>{1, 0};
+        if (text.ends_with(" B")) return std::vector<float>{9, 1};
+        if (text.ends_with(" D")) return std::vector<float>{6, 4};
+        return std::vector<float>{0, 5};
+    }
+};
+
+void reciprocalRankFusion(const fs::path& directory) {
+    auto store = openStore(directory / "fusion.sqlite");
+    // Equal document lengths; lexical order A,B,D,C by frequency, cosine order C,B,D,A.
+    for (const std::string text : {"needle needle needle needle A", "needle needle needle filler B",
+                                   "needle needle filler filler D", "needle filler filler filler C"}) {
+        requireValue(store->save("term.txt", text, {{1, text}}, DocumentPolicy::LocalOnly), "saving ranking fixture");
+    }
+    const auto question = requireValue(Question::fromText("needle"), "ranking question");
+    const auto lexical = requireValue(store->retrieve(question, requireValue(store->snapshot(), "FTS snapshot")), "BM25 search");
+    require(lexical.size() == 4 && lexical.front().documentId() == 1, "highest term frequency must win BM25");
+    FixtureEmbeddings provider;
+    requireValue(store->configureSearch(&provider, {}, true), "building hybrid ranking fixture");
+    const auto fused = requireValue(store->retrieve(question, requireValue(store->snapshot(), "hybrid snapshot")), "RRF search");
+    require(fused.size() == 4 && fused[0].documentId() == 2 && fused[1].documentId() == 1 &&
+            fused[2].documentId() == 4 && fused[3].documentId() == 3,
+            "second place on both lists must win RRF; symmetric ties must use the chunk key");
+}
+
+void hybridSearch(const fs::path& directory) {
+    const auto path = directory / "hybrid.sqlite";
+    FixtureEmbeddings model;
+    const DocxPosition cell{"word/document.xml", TableCell{3, 2, 1}};
+    {
+        auto store = openStore(path);
+        requireValue(store->configureSearch(&model), "activating fixture profile");
+        requireValue(store->save("one.txt", "Alpha", {{4, "Alpha"}}, DocumentPolicy::LocalOnly), "saving TXT");
+        requireValue(store->save("two.pdf", "Протокол", {{5, "Протокол", 2}}, DocumentPolicy::LocalOnly), "saving PDF");
+        requireValue(store->save("three.docx", "Archive", {{7, "Archive", {}, cell}}, DocumentPolicy::LocalOnly), "saving DOCX");
+    }
+    auto store = openStore(path);
+    requireValue(store->configureSearch(&model), "reopening fixture index");
+    const auto snapshot = requireValue(store->snapshot(), "reading hybrid snapshot");
+    const auto search = [&](std::string q) {
+        return requireValue(store->retrieve(requireValue(Question::fromText(std::move(q)), "question"), snapshot), "retrieving");
+    };
+    const auto exact = search("ПРОТОКОЛ \" OR (NEAR * -");
+    require(!exact.empty() && exact.front().page() == 2 && exact.front().documentId() == 2 && exact.front().line() == 5,
+            "escaped FTS syntax and Unicode term must rank the PDF first over a semantic tie");
+    const auto paraphrase = search("restore point");
+    require(!paraphrase.empty() && paraphrase.front().docx() == cell && paraphrase.front().documentId() == 3 &&
+            paraphrase.front().line() == 7, "vector-only paraphrase must recover the persisted DOCX cell");
+    const auto tied = search("unknown");
+    require(tied.size() == 3 && tied[0].documentId() == 1 && tied[0].line() == 4 && tied[1].documentId() == 2,
+            "equal cosine scores must sort by the persistent chunk key");
+    CountingProvider probe;
+    ValidatingLlmProvider validated(probe);
+    CachingLlmProvider cached(validated, *store);
+    RagService rag(*store, *store, cached);
+    require(!requireValue(rag.ask("restore point"), "first question").fromCache() &&
+            requireValue(rag.ask("restore point"), "repeated question").fromCache() && probe.calls == 1, "expected cache hit");
+    FixtureEmbeddings next;
+    next.id = "fixture-v2";
+    requireError(store->configureSearch(&next), AppError::SearchProfileMismatch, "profile switch needs reindex");
+    next.fail = true;
+    requireError(store->configureSearch(&next, {}, true), AppError::EmbeddingFailed, "partial reindex must roll back");
+    require(requireValue(store->snapshot(), "after failed rebuild").revision == snapshot.revision &&
+            requireValue(rag.ask("restore point"), "old index after failed rebuild").fromCache(), "previous index must stay usable");
+    model.fail = true;
+    requireError(store->save("broken.txt", "combined", {{1,"First"}, {2,"Archive"}}, DocumentPolicy::LocalOnly),
+                 AppError::EmbeddingFailed, "second embedding must abort publication");
+    require(fixtureScalar(path, "SELECT count(*) FROM embeddings") == 3 &&
+            fixtureScalar(path, "SELECT count(*) FROM documents") == 3 &&
+            fixtureScalar(path, "SELECT count(*) FROM chunks") == 3 &&
+            fixtureScalar(path, "SELECT count(*) FROM chunks_fts") == 3 &&
+            requireValue(store->snapshot(), "after failed import").revision == snapshot.revision,
+            "failed import must preserve all index components");
+    next.fail = false;
+    requireValue(store->configureSearch(&next, {}, true), "rebuilding for second model");
+    require(fixtureScalar(path, "SELECT count(*) FROM embeddings WHERE model='fixture-v2' AND dimension=2 AND length(vector)=8") == 3 &&
+            !requireValue(rag.ask("restore point"), "cache across model change").fromCache(), "all vectors and cache must switch");
+    SearchSettings tuning;
+    tuning.rrfConstant = 40;
+    requireValue(store->configureSearch(&next, tuning, true), "changing retrieval settings");
+    require(!requireValue(rag.ask("restore point"), "cache across settings change").fromCache() && probe.calls == 3,
+            "a change in ranking settings must invalidate the old answer");
+    requireError(store->retrieve(requireValue(Question::fromText("Archive"), "question"), snapshot),
+                 AppError::SearchProfileMismatch, "a stale admitted snapshot must not use the new index");
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -653,7 +771,13 @@ int wmain(int argc, wchar_t* argv[]) {
         } else if (test == L"migration_v3") {
             migrateDocxEra(directory.path());
         } else if (test == L"migration_v4") {
-            migrateRevisionEra(directory.path(), argv[2]);
+            migrateRevisionEra(directory.path(), argv[2], 4);
+        } else if (test == L"migration_v5") {
+            migrateRevisionEra(directory.path(), argv[2], 5);
+        } else if (test == L"hybrid_search") {
+            hybridSearch(directory.path());
+        } else if (test == L"rrf") {
+            reciprocalRankFusion(directory.path());
         } else if (test == L"policy_revisions") {
             policyRevisions(directory.path(), argv[2]);
         } else if (test == L"cache_history") {

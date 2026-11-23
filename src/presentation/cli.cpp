@@ -23,6 +23,10 @@ std::string_view describeError(AppError error) {
         return "Тестовый провайдер вернул неподтверждённую цитату.";
     case AppError::RemoteProcessingDenied:
         return "Внешняя обработка запрещена. Для неё требуется разрешение библиотеки и каждого документа.";
+    case AppError::EmbeddingFailed:
+        return "Не удалось загрузить модель или вычислить локальный вектор. Проверьте сборку, GGUF и длину фрагмента.";
+    case AppError::SearchProfileMismatch:
+        return "Индекс изменился или использует другой профиль. Повторите вопрос с тем же GGUF либо выполните --reindex.";
     case AppError::StoreReadFailed:
         return "Не удалось прочитать библиотеку документов.";
     case AppError::StoreWriteFailed:

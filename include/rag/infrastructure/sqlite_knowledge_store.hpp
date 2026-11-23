@@ -8,7 +8,7 @@ struct sqlite3;
 
 namespace rag {
 
-class SqliteKnowledgeStore final : public IKnowledgeStore, public IAnswerCacheStore, public IHistoryStore {
+class SqliteKnowledgeStore final : public IKnowledgeStore, public IAnswerCacheStore, public IHistoryStore, public IRetriever {
 public:
     static Result<std::unique_ptr<SqliteKnowledgeStore>> open(const std::filesystem::path& path,
                                                               bool createIfMissing = true);
@@ -26,6 +26,9 @@ public:
                                const ModelProfile& profile, const Answer& answer) override;
     Result<std::vector<HistoryEntry>> history() const override;
     Result<bool> clearHistory() override;
+    // Provider is local and must outlive subsequent indexing and search operations.
+    Result<bool> configureSearch(const IEmbeddingProvider* provider, SearchSettings settings = {}, bool rebuild = false);
+    Result<std::vector<Chunk>> retrieve(const Question& question, const LibrarySnapshot& library) const override;
 
 private:
     struct CloseDatabase {
@@ -36,6 +39,8 @@ private:
     explicit SqliteKnowledgeStore(Database database) : database_(std::move(database)) {}
 
     Database database_;
+    const IEmbeddingProvider* embeddings_ = nullptr;
+    SearchSettings settings_;
 };
 
 }  // namespace rag

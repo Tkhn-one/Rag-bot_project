@@ -1,5 +1,6 @@
 #include "rag/application/services.hpp"
 #include "rag/infrastructure/adapters.hpp"
+#include "rag/infrastructure/local_embeddings.hpp"
 #include "rag/infrastructure/sqlite_knowledge_store.hpp"
 #include "rag/infrastructure/utf8.hpp"
 #include "rag/presentation/cli.hpp"
@@ -62,19 +63,26 @@ int wmain(int argc, wchar_t* argv[]) {
     const bool viewHistory = command == L"--history";
     const bool clearHistory = command == L"--clear-history";
     const bool historyCommand = viewHistory || clearHistory;
-    const bool useDatabase = command == L"--db";
-    const int firstFile = useDatabase ? 3 : 1;
+    const bool reindex = command == L"--reindex";
+    const bool useDatabase = command == L"--db" || reindex;
+    int firstFile = useDatabase ? 3 : 1;
+    const bool withModel = argc > firstFile && std::wstring_view(argv[firstFile]) == L"--embedding-model";
+    const int modelArg = firstFile + 1;
+    if (withModel) firstFile += 2;
     const int minimumArguments = useDatabase ? 4 : 3;
-    if ((historyCommand && argc != 3) || (!historyCommand && argc < minimumArguments)) {
+    if ((historyCommand && argc != 3) || (reindex && argc != firstFile) ||
+        (!historyCommand && !reindex && (argc < minimumArguments || argc <= firstFile))) {
         print(STD_ERROR_HANDLE, std::cerr,
               "Использование: rag_cli <файл.txt|pdf|docx> [<ещё-файл> ...] \"<вопрос>\"\n"
               "               rag_cli --db <путь-к-базе> [<файл.txt|pdf|docx> ...] \"<вопрос>\"\n"
               "               rag_cli --history <путь-к-базе>\n"
-              "               rag_cli --clear-history <путь-к-базе>\n");
+              "               rag_cli --clear-history <путь-к-базе>\n"
+              "               rag_cli --reindex <база> [--embedding-model <GGUF>]\n"
+              "               rag_cli --db <база> --embedding-model <GGUF> [<файл> ...] \"<вопрос>\"\n");
         return 2;
     }
 
-    auto opened = (useDatabase || historyCommand) ? rag::SqliteKnowledgeStore::open(argv[2], !historyCommand)
+    auto opened = (useDatabase || historyCommand) ? rag::SqliteKnowledgeStore::open(argv[2], !historyCommand && !reindex)
                                                   : rag::SqliteKnowledgeStore::openInMemory();
     if (const auto* error = std::get_if<rag::AppError>(&opened)) {
         print(STD_ERROR_HANDLE, std::cerr, std::string(rag::describeError(*error)) + '\n');
@@ -90,6 +98,24 @@ int wmain(int argc, wchar_t* argv[]) {
         return status;
     }
 
+    std::unique_ptr<rag::IEmbeddingProvider> embeddings;
+    if (withModel) {
+        auto model = rag::openLocalEmbeddings(argv[modelArg]);
+        if (const auto* error = std::get_if<rag::AppError>(&model)) {
+            print(STD_ERROR_HANDLE, std::cerr, std::string(rag::describeError(*error)) + '\n');
+            return 1;
+        }
+        embeddings = std::get<std::unique_ptr<rag::IEmbeddingProvider>>(std::move(model));
+    }
+    auto configured = store->configureSearch(embeddings.get(), {}, reindex);
+    if (const auto* error = std::get_if<rag::AppError>(&configured)) {
+        print(STD_ERROR_HANDLE, std::cerr, std::string(rag::describeError(*error)) + '\n');
+        return 1;
+    }
+    if (reindex) {
+        print(STD_OUTPUT_HANDLE, std::cout, "Поисковый индекс перестроен.\n");
+        return 0;
+    }
     const auto question = rag::encodeUtf8(argv[argc - 1]);
     if (!question) {
         print(STD_ERROR_HANDLE, std::cerr, "Не удалось прочитать вопрос.\n");
@@ -97,12 +123,11 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     const DocumentReader reader;
-    const rag::KeywordRetriever retriever;
     rag::MockProvider provider;
     rag::ValidatingLlmProvider validated(provider);
     rag::CachingLlmProvider cached(validated, *store);
     rag::IndexingService index(reader, *store);
-    rag::RagService service(*store, retriever, cached, store.get());
+    rag::RagService service(*store, *store, cached, store.get());
 
     const std::vector<std::filesystem::path> files(argv + firstFile, argv + argc - 1);
     const auto status = rag::runCli(index, service, files, *question, output, errors);

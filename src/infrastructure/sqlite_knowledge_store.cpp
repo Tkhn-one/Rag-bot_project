@@ -1,6 +1,8 @@
 #include "rag/infrastructure/sqlite_knowledge_store.hpp"
 #include "rag/infrastructure/utf8.hpp"
 #include "cache_key.hpp"
+#include "sqlite_search.hpp"
+#include "sqlite_helpers.hpp"
 
 #include <sqlite3.h>
 
@@ -8,7 +10,7 @@ namespace rag {
 namespace {
 
 constexpr int applicationId = 0x52414742;  // RAGB
-constexpr int schemaVersion = 5;
+constexpr int schemaVersion = 6;
 constexpr auto createV2Schema = R"sql(
     CREATE TABLE documents (
         id INTEGER PRIMARY KEY,
@@ -79,68 +81,7 @@ constexpr auto addCacheAndHistory = R"sql(
     PRAGMA user_version = 5;
 )sql";
 
-using Statement = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
-
-Statement prepare(sqlite3* database, const char* sql) {
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(database, sql, -1, &statement, nullptr);
-    return Statement(statement, sqlite3_finalize);
-}
-
-bool execute(sqlite3* database, const char* sql) {
-    return sqlite3_exec(database, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
-}
-
-class WriteTransaction {
-public:
-    explicit WriteTransaction(sqlite3* database)
-        : database_(database), active_(execute(database, "BEGIN IMMEDIATE")) {}
-
-    WriteTransaction(const WriteTransaction&) = delete;
-    WriteTransaction& operator=(const WriteTransaction&) = delete;
-
-    ~WriteTransaction() {
-        if (active_) {
-            execute(database_, "ROLLBACK");
-        }
-    }
-
-    bool started() const { return active_; }
-
-    bool commit() {
-        if (!execute(database_, "COMMIT")) {
-            return false;
-        }
-        active_ = false;
-        return true;
-    }
-
-private:
-    sqlite3* database_;
-    bool active_;
-};
-
-AppError databaseError(sqlite3* database, AppError fallback) {
-    const auto code = sqlite3_errcode(database);
-    if (code == SQLITE_CORRUPT || code == SQLITE_NOTADB) {
-        return AppError::StoreCorrupt;
-    }
-    return fallback;
-}
-
-std::optional<std::string> readText(sqlite3_stmt* statement, int column) {
-    const auto* value = sqlite3_column_text(statement, column);
-    if (!value) {
-        return std::nullopt;
-    }
-    return std::string(reinterpret_cast<const char*>(value),
-                       static_cast<std::size_t>(sqlite3_column_bytes(statement, column)));
-}
-
-bool bindText(sqlite3_stmt* statement, int index, const std::string& text) {
-    return sqlite3_bind_text64(statement, index, text.data(), text.size(), SQLITE_TRANSIENT,
-                               SQLITE_UTF8) == SQLITE_OK;
-}
+using namespace sql;
 
 struct Schema {
     int application;
@@ -180,7 +121,8 @@ std::optional<AppError> initializeSchema(sqlite3* database) {
             return AppError::StoreSchemaUnsupported;
         }
         if (!execute(database, createV2Schema) || !execute(database, addDocxPositions) ||
-            !execute(database, addLibraryMetadata) || !execute(database, addCacheAndHistory)) {
+            !execute(database, addLibraryMetadata) || !execute(database, addCacheAndHistory) ||
+            !execute(database, createSearchIndex)) {
             return databaseError(database, AppError::StoreWriteFailed);
         }
     }
@@ -296,7 +238,9 @@ std::optional<AppError> migrateLegacy(sqlite3* database, const std::filesystem::
             (schema->version == 1 && !upgradeV1(database)) ||
             (schema->version <= 2 && !execute(database, addDocxPositions)) ||
             (schema->version <= 3 && !execute(database, addLibraryMetadata)) ||
-            !execute(database, addCacheAndHistory)) {
+            (schema->version <= 4 && !execute(database, addCacheAndHistory)) ||
+            !execute(database, createSearchIndex) ||
+            (schema->version >= 4 && !execute(database, "UPDATE library SET revision = revision + 1 WHERE id=1"))) {
             return databaseError(database, AppError::StoreMigrationFailed);
         }
     }
@@ -359,7 +303,8 @@ bool advanceRevision(sqlite3* database) {
 
 Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
                                   const std::string& content, std::span<const DocumentLine> lines,
-                                  DocumentPolicy policy, const std::string& positionLayout) {
+                                  DocumentPolicy policy, const std::string& positionLayout,
+                                  const IEmbeddingProvider* embeddings) {
     const auto document = prepare(database, R"sql(
         INSERT INTO documents (source, content, policy, position_layout) VALUES (?1, ?2, ?3, ?4)
         ON CONFLICT (content, position_layout) DO NOTHING
@@ -390,6 +335,12 @@ Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
             !bindText(chunk.get(), 3, line.text) || sqlite3_step(chunk.get()) != SQLITE_DONE ||
             sqlite3_reset(chunk.get()) != SQLITE_OK) {
             return databaseError(database, AppError::StoreWriteFailed);
+        }
+        if (embeddings) {
+            const auto indexed = indexVector(database, *embeddings, id, line.number, line.text);
+            if (const auto* error = std::get_if<AppError>(&indexed)) {
+                return *error;
+            }
         }
     }
     if (!advanceRevision(database)) {
@@ -568,7 +519,14 @@ Result<std::size_t> SqliteKnowledgeStore::save(std::string source, std::string c
         return databaseError(database_.get(), AppError::StoreWriteFailed);
     }
 
-    const auto result = writeDocument(database_.get(), source, content, lines, policy, positionLayout);
+    const auto matches = searchProfileMatches(database_.get(), embeddings_, settings_);
+    if (const auto* error = std::get_if<AppError>(&matches)) {
+        return *error;
+    }
+    if (!std::get<bool>(matches)) {
+        return AppError::SearchProfileMismatch;
+    }
+    const auto result = writeDocument(database_.get(), source, content, lines, policy, positionLayout, embeddings_);
     if (std::holds_alternative<AppError>(result)) {
         return result;
     }

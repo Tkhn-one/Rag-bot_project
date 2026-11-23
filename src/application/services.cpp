@@ -171,7 +171,11 @@ Result<Answer> RagService::ask(std::string text) {
     }
 
     const auto& query = std::get<Question>(question);
-    const auto evidence = retriever_.retrieve(query, documents);
+    const auto retrieved = retriever_.retrieve(query, library);
+    if (const auto* error = std::get_if<AppError>(&retrieved)) {
+        return *error;
+    }
+    const auto& evidence = std::get<std::vector<Chunk>>(retrieved);
     if (evidence.empty()) {
         return complete(Answer{});
     }

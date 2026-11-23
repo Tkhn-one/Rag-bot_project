@@ -32,7 +32,7 @@ FetchContent_MakeAvailable(sqlite_amalgamation)
 
 add_library(rag_sqlite STATIC "${sqlite_amalgamation_SOURCE_DIR}/sqlite3.c")
 target_include_directories(rag_sqlite SYSTEM PUBLIC "${sqlite_amalgamation_SOURCE_DIR}")
-target_compile_definitions(rag_sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION)
+target_compile_definitions(rag_sqlite PRIVATE SQLITE_OMIT_LOAD_EXTENSION SQLITE_ENABLE_FTS5)
 
 if(NOT MSVC OR NOT CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
     message(FATAL_ERROR "The pinned PDFium binary requires MSVC targeting Windows x64.")
@@ -97,6 +97,7 @@ add_library(rag_application src/application/services.cpp)
 target_link_libraries(rag_application PUBLIC rag_domain)
 
 add_library(rag_infrastructure
+    src/infrastructure/local_embeddings.cpp
     src/infrastructure/cache_key.cpp
     src/infrastructure/txt_reader.cpp
     src/infrastructure/pdf_reader.cpp
@@ -104,10 +105,28 @@ add_library(rag_infrastructure
     src/infrastructure/local_file.cpp
     src/infrastructure/keyword_retriever.cpp
     src/infrastructure/sqlite_knowledge_store.cpp
+    src/infrastructure/sqlite_search.cpp
     src/infrastructure/utf8.cpp
 )
 target_link_libraries(rag_infrastructure PUBLIC rag_application
     PRIVATE rag_sqlite rag_pdfium rag_miniz rag_pugixml bcrypt)
+
+set(RAG_LLAMA_ARCHIVE "" CACHE FILEPATH "Local llama.cpp b6500 source archive for CPU embeddings")
+if(RAG_LLAMA_ARCHIVE)
+    if(NOT EXISTS "${RAG_LLAMA_ARCHIVE}")
+        message(FATAL_ERROR "RAG_LLAMA_ARCHIVE must point to the local b6500 source archive.")
+    endif()
+    set(BUILD_SHARED_LIBS OFF)
+    set(LLAMA_BUILD_COMMON OFF)
+    set(LLAMA_CURL OFF)
+    set(GGML_NATIVE OFF)
+    set(GGML_OPENMP OFF)
+    FetchContent_Declare(llama_runtime URL "${RAG_LLAMA_ARCHIVE}"
+        URL_HASH SHA256=f2a188b194f25178460eecda7a7619b34d0b53421588faa2e6f0287a96674f28)
+    FetchContent_MakeAvailable(llama_runtime)
+    target_link_libraries(rag_infrastructure PRIVATE llama)
+    target_compile_definitions(rag_infrastructure PRIVATE RAG_LLAMA_EMBEDDINGS)
+endif()
 
 add_executable(rag_cli apps/main.cpp src/presentation/cli.cpp)
 target_link_libraries(rag_cli PRIVATE rag_application rag_infrastructure)
@@ -131,7 +150,7 @@ if(BUILD_TESTING)
     add_executable(rag_sqlite_tests tests/sqlite_tests.cpp)
     target_link_libraries(rag_sqlite_tests PRIVATE rag_infrastructure rag_sqlite)
     foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure
-                          migration_v2 migration_v3 migration_v4 policy_revisions cache_history cache_access_errors)
+                          migration_v2 migration_v3 migration_v4 migration_v5 policy_revisions cache_history cache_access_errors hybrid_search rrf)
         add_test(NAME sqlite_${case}
                  COMMAND rag_sqlite_tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
                          "${CMAKE_CURRENT_BINARY_DIR}")

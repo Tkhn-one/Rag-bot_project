@@ -98,8 +98,7 @@ private:
 
 class KeywordRetriever final : public IRetriever {
 public:
-    std::vector<Chunk> retrieve(const Question& question,
-                                std::span<const IndexedDocument> documents) const override;
+    Result<std::vector<Chunk>> retrieve(const Question& question, const LibrarySnapshot& library) const override;
 };
 
 class MockProvider final : public ILlmProvider {

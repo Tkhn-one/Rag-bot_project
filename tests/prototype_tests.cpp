@@ -117,10 +117,9 @@ std::vector<IndexedDocument> storedDocuments(const InMemoryKnowledgeStore& store
 
 class CountingRetriever final : public IRetriever {
 public:
-    std::vector<Chunk> retrieve(const Question& question,
-                                std::span<const IndexedDocument> documents) const override {
+    Result<std::vector<Chunk>> retrieve(const Question& question, const LibrarySnapshot& library) const override {
         ++calls;
-        return KeywordRetriever{}.retrieve(question, documents);
+        return KeywordRetriever{}.retrieve(question, library);
     }
 
     mutable int calls = 0;

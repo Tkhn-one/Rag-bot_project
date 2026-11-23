@@ -30,7 +30,9 @@ enum class AppError {
     DocxCorrupt,
     DocxNoText,
     DocxLimitExceeded,
-    RemoteProcessingDenied
+    RemoteProcessingDenied,
+    EmbeddingFailed,
+    SearchProfileMismatch
 };
 
 template <typename T>
