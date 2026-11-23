@@ -58,14 +58,36 @@ void print(DWORD handleId, std::ostream& stream, const std::string& utf8) {
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
-    const bool useDatabase = argc > 1 && std::wstring_view(argv[1]) == L"--db";
+    const auto command = argc > 1 ? std::wstring_view(argv[1]) : std::wstring_view{};
+    const bool viewHistory = command == L"--history";
+    const bool clearHistory = command == L"--clear-history";
+    const bool historyCommand = viewHistory || clearHistory;
+    const bool useDatabase = command == L"--db";
     const int firstFile = useDatabase ? 3 : 1;
     const int minimumArguments = useDatabase ? 4 : 3;
-    if (argc < minimumArguments) {
+    if ((historyCommand && argc != 3) || (!historyCommand && argc < minimumArguments)) {
         print(STD_ERROR_HANDLE, std::cerr,
               "Использование: rag_cli <файл.txt|pdf|docx> [<ещё-файл> ...] \"<вопрос>\"\n"
-              "               rag_cli --db <путь-к-базе> [<файл.txt|pdf|docx> ...] \"<вопрос>\"\n");
+              "               rag_cli --db <путь-к-базе> [<файл.txt|pdf|docx> ...] \"<вопрос>\"\n"
+              "               rag_cli --history <путь-к-базе>\n"
+              "               rag_cli --clear-history <путь-к-базе>\n");
         return 2;
+    }
+
+    auto opened = (useDatabase || historyCommand) ? rag::SqliteKnowledgeStore::open(argv[2], !historyCommand)
+                                                  : rag::SqliteKnowledgeStore::openInMemory();
+    if (const auto* error = std::get_if<rag::AppError>(&opened)) {
+        print(STD_ERROR_HANDLE, std::cerr, std::string(rag::describeError(*error)) + '\n');
+        return 1;
+    }
+    auto store = std::get<std::unique_ptr<rag::SqliteKnowledgeStore>>(std::move(opened));
+    std::ostringstream output;
+    std::ostringstream errors;
+    if (historyCommand) {
+        const int status = rag::runHistoryCli(*store, clearHistory, output, errors);
+        print(STD_OUTPUT_HANDLE, std::cout, output.str());
+        print(STD_ERROR_HANDLE, std::cerr, errors.str());
+        return status;
     }
 
     const auto question = rag::encodeUtf8(argv[argc - 1]);
@@ -74,27 +96,15 @@ int wmain(int argc, wchar_t* argv[]) {
         return 2;
     }
 
-    std::unique_ptr<rag::IKnowledgeStore> store;
-    if (useDatabase) {
-        auto opened = rag::SqliteKnowledgeStore::open(argv[2]);
-        if (const auto* error = std::get_if<rag::AppError>(&opened)) {
-            print(STD_ERROR_HANDLE, std::cerr, std::string(rag::describeError(*error)) + '\n');
-            return 1;
-        }
-        store = std::get<std::unique_ptr<rag::SqliteKnowledgeStore>>(std::move(opened));
-    } else {
-        store = std::make_unique<rag::InMemoryKnowledgeStore>();
-    }
-
     const DocumentReader reader;
     const rag::KeywordRetriever retriever;
     rag::MockProvider provider;
+    rag::ValidatingLlmProvider validated(provider);
+    rag::CachingLlmProvider cached(validated, *store);
     rag::IndexingService index(reader, *store);
-    rag::RagService service(*store, retriever, provider);
+    rag::RagService service(*store, retriever, cached, store.get());
 
     const std::vector<std::filesystem::path> files(argv + firstFile, argv + argc - 1);
-    std::ostringstream output;
-    std::ostringstream errors;
     const auto status = rag::runCli(index, service, files, *question, output, errors);
     print(STD_OUTPUT_HANDLE, std::cout, output.str());
     print(STD_ERROR_HANDLE, std::cerr, errors.str());

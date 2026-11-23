@@ -53,6 +53,69 @@ std::string_view describeError(AppError error) {
     return "Не удалось выполнить запрос.";
 }
 
+namespace {
+
+void printAnswer(const Answer& answer, std::ostream& output) {
+    if (answer.fromCache()) {
+        output << "Ответ из кэша.\n";
+    }
+    const auto& citation = answer.citation();
+    if (!citation) {
+        output << "В библиотеке не найдено подтверждения по словам вопроса.\n";
+        return;
+    }
+
+    output << "Найденный фрагмент (тестовый провайдер)\n"
+           << "«" << citation->quote() << "»\n"
+           << "Источник: " << citation->source();
+    if (const auto& docx = citation->docx()) {
+        output << ", часть " << docx->part;
+        if (const auto* paragraph = std::get_if<std::size_t>(&docx->anchor)) {
+            output << ", абзац " << *paragraph;
+        } else {
+            const auto& cell = std::get<TableCell>(docx->anchor);
+            output << ", таблица " << cell.table << ", строка " << cell.row << ", ячейка " << cell.cell;
+        }
+    } else if (const auto page = citation->page()) {
+        output << ", страница " << *page;
+    } else {
+        output << ", строка " << citation->line();
+    }
+    output << " (ID документа " << citation->documentId() << ")\n";
+}
+
+}  // namespace
+
+int runHistoryCli(IHistoryStore& store, bool clear, std::ostream& output, std::ostream& errors) {
+    if (clear) {
+        const auto result = store.clearHistory();
+        if (const auto* error = std::get_if<AppError>(&result)) {
+            errors << describeError(*error) << '\n';
+            return 1;
+        }
+        output << "История очищена.\n";
+        return 0;
+    }
+    const auto result = store.history();
+    if (const auto* error = std::get_if<AppError>(&result)) {
+        errors << describeError(*error) << '\n';
+        return 1;
+    }
+    const auto& entries = std::get<std::vector<HistoryEntry>>(result);
+    if (entries.empty()) {
+        output << "История пуста.\n";
+    } else {
+        output << "Каждый вопрос задаётся отдельно.\n";
+    }
+    for (const auto& entry : entries) {
+        output << '\n' << entry.timeUtc << " | " << entry.profile.modelId << " | ревизия "
+               << entry.revision.number << (entry.outdated ? " (устарела)" : "") << '\n'
+               << entry.question << '\n';
+        printAnswer(entry.answer, output);
+    }
+    return 0;
+}
+
 int runCli(IndexingService& index, RagService& rag, std::span<const std::filesystem::path> files,
            std::string question, std::ostream& output, std::ostream& errors) {
     std::size_t failedImports = 0;
@@ -92,29 +155,7 @@ int runCli(IndexingService& index, RagService& rag, std::span<const std::filesys
         return 1;
     }
 
-    const auto& citation = std::get<Answer>(result).citation();
-    if (!citation) {
-        output << "В библиотеке не найдено подтверждения по словам вопроса.\n";
-        return status;
-    }
-
-    output << "Найденный фрагмент (тестовый провайдер)\n"
-           << "«" << citation->quote() << "»\n"
-           << "Источник: " << citation->source();
-    if (const auto& docx = citation->docx()) {
-        output << ", часть " << docx->part;
-        if (const auto* paragraph = std::get_if<std::size_t>(&docx->anchor)) {
-            output << ", абзац " << *paragraph;
-        } else {
-            const auto& cell = std::get<TableCell>(docx->anchor);
-            output << ", таблица " << cell.table << ", строка " << cell.row << ", ячейка " << cell.cell;
-        }
-    } else if (const auto page = citation->page()) {
-        output << ", страница " << *page;
-    } else {
-        output << ", строка " << citation->line();
-    }
-    output << " (ID документа " << citation->documentId() << ")\n";
+    printAnswer(std::get<Answer>(result), output);
     return status;
 }
 

@@ -345,7 +345,7 @@ void migrate(const fs::path& directory) {
     createLegacyLibrary(path);
     const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 4, "opened database must advance to v4");
+    require(fixtureScalar(path, "PRAGMA user_version") == 5, "opened database must advance to v5");
     require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
                 fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
             "backup must retain the v1 schema, document ID and line");
@@ -357,7 +357,7 @@ void migrate(const fs::path& directory) {
     requireCitation(*store, decisionsQuestion, 42, "decisions.txt", decisionsQuote);
     requireCitation(*openStore(path), decisionsQuestion, 42, "decisions.txt", decisionsQuote);
     require(!fs::exists(directory / "legacy.sqlite.v1-backup-1"),
-            "reopening v4 must not repeat the migration");
+            "reopening v5 must not repeat the migration");
 }
 
 void migrationFailure(const fs::path& directory) {
@@ -403,7 +403,7 @@ void migratePdfEra(const fs::path& directory) {
             (42, 1, 'Orion snapshot runs every Friday.', 2);
     )sql");
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 4, "v2 must advance to v4");
+    require(fixtureScalar(path, "PRAGMA user_version") == 5, "v2 must advance to v5");
     const auto backup = directory / "pdf-era.sqlite.v2-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 2 &&
                 fixtureScalar(backup, "SELECT page FROM chunks WHERE document_id = 42") == 2,
@@ -444,7 +444,7 @@ void migrateDocxEra(const fs::path& directory) {
     const auto backup = directory / "docx-era.sqlite.v3-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 3 &&
                 fixtureScalar(backup, "SELECT docx_row FROM chunks WHERE document_id = 17 AND line = 2") == 2 &&
-                fixtureScalar(path, "PRAGMA user_version") == 4, "migration must preserve a readable v3 backup");
+                fixtureScalar(path, "PRAGMA user_version") == 5, "migration must preserve a readable v3 backup");
     const auto snapshot = requireValue(store->snapshot(), "reading migrated v3 library");
     require(snapshot.revision.number == 0 && snapshot.policy == DocumentPolicy::LocalOnly &&
                 snapshot.documents.size() == 1, "migration starts a closed library at its baseline revision");
@@ -459,6 +459,172 @@ void migrateDocxEra(const fs::path& directory) {
     require(requireValue(openStore(path)->snapshot(), "reopening migrated library").revision == snapshot.revision &&
                 !fs::exists(directory / "docx-era.sqlite.v3-backup-1"),
             "reopening must preserve the migrated identity without repeating the migration");
+}
+
+void migrateRevisionEra(const fs::path& directory, const fs::path& demo) {
+    const auto path = directory / "revision-era.sqlite";
+    IndexRevision previous;
+    {
+        const auto store = openStore(path);
+        const TxtReader reader;
+        IndexingService index(reader, *store);
+        requireValue(index.import(demo / "decisions.txt"), "preparing a revisioned library");
+        previous = requireValue(store->snapshot(), "reading the previous revision").revision;
+    }
+    // V4 has exactly the same library, documents and chunks, without the two new tables.
+    executeFixtureSql(path, "DROP TABLE answer_cache; DROP TABLE history; PRAGMA user_version = 4");
+    const auto migrated = openStore(path);
+    const auto backup = directory / "revision-era.sqlite.v4-backup" / "library.sqlite";
+    require(fixtureScalar(backup, "PRAGMA user_version") == 4 &&
+                fixtureScalar(backup, "SELECT count(*) FROM documents") == 1 &&
+                fixtureScalar(path, "PRAGMA user_version") == 5 &&
+                requireValue(migrated->snapshot(), "reading the migrated revision").revision == previous &&
+                requireValue(migrated->history(), "reading initial history").empty(),
+            "v4 migration must back up the database and preserve its existing identity and revision");
+    requireCitation(*migrated, decisionsQuestion, 1, "decisions.txt", decisionsQuote);
+}
+
+class CountingProvider final : public ILlmProvider {
+public:
+    ModelProfile configured{ProcessingType::Local, "probe"};
+    int calls = 0;
+    bool invalidPosition = false;
+    bool fail = false;
+    std::string lastQuestion;
+
+    ModelProfile profile() const override { return configured; }
+    Result<ProposedCitation> generate(const GenerationRequest& request) override {
+        ++calls;
+        lastQuestion = request.question.text();
+        if (fail) {
+            return AppError::StoreUnavailable;
+        }
+        auto citation = ProposedCitation::fromChunk(request.evidence.front());
+        if (invalidPosition) {
+            citation.docx.reset();
+            citation.page = 999;
+        }
+        return citation;
+    }
+};
+
+void cacheAndHistory(const fs::path& directory) {
+    const auto path = directory / "answers.sqlite";
+    const KeywordRetriever retriever;
+    const std::string original = " \tOrion\r\nsnapshot ";
+    const DocxPosition location{"word/document.xml", TableCell{1, 2, 3}};
+    {
+        const auto store = openStore(path);
+        executeFixtureSql(path, "UPDATE library SET library_id = '11111111111111111111111111111111'");
+        requireValue(store->save("source.docx", "Orion", {{3, "Orion", {}, location}},
+                                 DocumentPolicy::LocalOnly), "saving source");
+        CountingProvider probe;
+        ValidatingLlmProvider validated(probe);
+        CachingLlmProvider cached(validated, *store);
+        RagService service(*store, retriever, cached, store.get());
+        const auto first = requireValue(service.ask(original), "asking the first question");
+        require(!first.fromCache() && first.citation() && probe.calls == 1 &&
+                    probe.lastQuestion == "Orion\nsnapshot", "miss must generate once with canonical newlines");
+        require(requireValue(service.ask("Orion\rsnapshot"), "asking equivalent question").fromCache() &&
+                    probe.calls == 1, "repeated question must skip generation");
+        require(fixtureScalar(path, "SELECT count(*) FROM answer_cache WHERE hex(key) = "
+                     "'AC40638C0F3A33755FF6AC1B634674BE26B4F40533905D66451D6B0D6866E0CB'") == 1,
+                "persisted digest must match the independent SHA-256 test vector");
+    }
+    const auto store = openStore(path);
+    CountingProvider probe;
+    ValidatingLlmProvider validated(probe);
+    CachingLlmProvider cached(validated, *store);
+    RagService service(*store, retriever, cached, store.get());
+    require(requireValue(service.ask("Orion\nsnapshot"), "asking after reopen").fromCache() && probe.calls == 0,
+            "a persisted hit must skip a freshly constructed provider");
+    const auto history = requireValue(store->history(), "reading durable questions");
+    require(history.size() == 3 && history[0].question == original && !history[0].answer.fromCache() &&
+                history[1].answer.fromCache() && history[2].answer.fromCache(), "both cache hits must be in history");
+    for (const auto& entry : history) {
+        const auto& c = entry.answer.citation();
+        require(!entry.timeUtc.empty() && entry.timeUtc.back() == 'Z' && !entry.outdated &&
+                    entry.revision == IndexRevision{std::string(32, '1'), 1} && entry.profile == probe.configured &&
+                    c && c->documentId() == 1 && c->line() == 3 && c->source() == "source.docx" &&
+                    c->quote() == "Orion" && !c->page() && c->docx() == location,
+                "history must preserve the revision, profile, UTC time and complete citation");
+    }
+    for (const auto question : {"orion\nsnapshot", "Orion  snapshot", "Orion snapshot", "Orion snapshot!"}) {
+        const int before = probe.calls;
+        require(!requireValue(service.ask(question), "checking distinct question").fromCache() &&
+                    probe.calls == before + 1 && probe.lastQuestion == question,
+                "case, punctuation and inner whitespace must distinguish standalone questions");
+    }
+    requireValue(store->setLibraryPolicy(DocumentPolicy::AllowRemote), "changing revision");
+    const int beforeRevision = probe.calls;
+    require(!requireValue(service.ask(original), "asking after revision change").fromCache() &&
+                probe.calls == beforeRevision + 1 && requireValue(store->history(), "checking stale history")[0].outdated,
+            "a changed revision must miss and mark previous entries outdated");
+    const auto baseline = probe.configured;
+    for (auto field : {&ModelProfile::modelId, &ModelProfile::generationParameters, &ModelProfile::responseFormat,
+                       &ModelProfile::endpoint, &ModelProfile::credentialScope}) {
+        probe.configured = baseline;
+        probe.configured.*field += "-changed";
+        const int before = probe.calls;
+        require(!requireValue(service.ask(original), "asking after profile change").fromCache() &&
+                    probe.calls == before + 1, "changing any identity field must cause a miss");
+    }
+    const auto noMatch = requireValue(service.ask("absent"), "asking without evidence");
+    require(!noMatch.citation() && !requireValue(store->history(), "reading no-match history").back().answer.citation(),
+            "insufficient evidence must be a completed history result");
+    requireValue(store->clearHistory(), "clearing history");
+    require(requireValue(store->history(), "reading cleared history").empty() &&
+                requireValue(service.ask(original), "checking cache after clearing history").fromCache(),
+            "history cleanup must preserve the cached answer");
+}
+
+class CountingCache final : public IAnswerCacheStore {
+public:
+    explicit CountingCache(IAnswerCacheStore& store) : store_(store) {}
+    mutable int reads = 0;
+    int writes = 0;
+    Result<std::optional<ChunkReference>> lookup(const GenerationRequest& request) const override {
+        ++reads;
+        return store_.lookup(request);
+    }
+    Result<bool> remember(const GenerationRequest& request, ChunkReference citation) override {
+        ++writes;
+        return store_.remember(request, citation);
+    }
+private:
+    IAnswerCacheStore& store_;
+};
+
+void cacheAccessAndFailures(const fs::path& directory) {
+    const auto store = openStore(directory / "private.sqlite");
+    const KeywordRetriever retriever;
+    CountingProvider probe;
+    CountingCache cache(*store);
+    ValidatingLlmProvider validated(probe);
+    CachingLlmProvider cached(validated, cache);
+    RagService service(*store, retriever, cached, store.get());
+    requireValue(store->save("private.pdf", "Orion", {{1, "Orion", 2}}, DocumentPolicy::LocalOnly), "saving PDF");
+    probe.configured.processing = ProcessingType::Remote;
+    requireError(service.ask("Orion"), AppError::RemoteProcessingDenied, "private library must block external profile");
+    requireValue(store->setLibraryPolicy(DocumentPolicy::AllowRemote), "granting only library access");
+    requireError(service.ask("Orion"), AppError::RemoteProcessingDenied, "private document must block external profile");
+    require(cache.reads == 0 && cache.writes == 0 && probe.calls == 0, "denial must precede even reading the cache");
+
+    probe.configured.processing = ProcessingType::Local;
+    probe.invalidPosition = true;
+    for (int i = 0; i < 2; ++i) {
+        requireError(service.ask("Orion"), AppError::InvalidCitation, "invalid page must fail on every attempt");
+    }
+    probe.invalidPosition = false;
+    probe.fail = true;
+    requireError(service.ask("Orion"), AppError::StoreUnavailable, "provider failure must propagate");
+    require(cache.reads == 3 && probe.calls == 3 && cache.writes == 0 &&
+                requireValue(store->history(), "checking rejected requests").empty(),
+            "failures must leave both cache and completed history empty");
+    probe.fail = false;
+    require(!requireValue(service.ask("Orion"), "retrying corrected citation").fromCache() &&
+                requireValue(service.ask("Orion"), "reading corrected citation").fromCache() &&
+                probe.calls == 4 && cache.writes == 1, "only a validated retry may populate the cache");
 }
 
 }  // namespace
@@ -486,8 +652,14 @@ int wmain(int argc, wchar_t* argv[]) {
             migratePdfEra(directory.path());
         } else if (test == L"migration_v3") {
             migrateDocxEra(directory.path());
+        } else if (test == L"migration_v4") {
+            migrateRevisionEra(directory.path(), argv[2]);
         } else if (test == L"policy_revisions") {
             policyRevisions(directory.path(), argv[2]);
+        } else if (test == L"cache_history") {
+            cacheAndHistory(directory.path());
+        } else if (test == L"cache_access_errors") {
+            cacheAccessAndFailures(directory.path());
         } else {
             return 2;
         }

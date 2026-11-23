@@ -23,7 +23,7 @@ file(REMOVE_RECURSE "${test_dir}")
 if(NOT first_status STREQUAL "0" OR NOT second_status STREQUAL "0")
     message(FATAL_ERROR "CLI exits: ${first_status}, ${second_status}\n${first_error}${second_error}")
 endif()
-if(NOT first_output STREQUAL second_output OR
+if(NOT second_output STREQUAL "Ответ из кэша.\n${first_output}" OR
    NOT first_output MATCHES "Резервное копирование выполняется каждую пятницу[.]" OR
    NOT first_output MATCHES "decisions[.]txt, строка 4 [(]ID документа 2[)]")
     message(FATAL_ERROR "Expected the same stored decisions.txt citation twice:\n${first_output}\n${second_output}")

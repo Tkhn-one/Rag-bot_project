@@ -17,7 +17,7 @@ if(CASE STREQUAL "persistence")
     )
     file(REMOVE_RECURSE "${test_dir}")
     if(NOT status STREQUAL "0" OR NOT reopened_status STREQUAL "0" OR
-       NOT errors STREQUAL "" OR NOT reopened_errors STREQUAL "" OR NOT first STREQUAL second OR
+       NOT errors STREQUAL "" OR NOT reopened_errors STREQUAL "" OR NOT second STREQUAL "Ответ из кэша.\n${first}" OR
        NOT second MATCHES "Orion snapshot runs every Friday[.]" OR
        NOT second MATCHES "backup-protocol[.]PDF, страница 2 [(]ID документа 2[)]")
         message(FATAL_ERROR "Expected the same page 2 citation before and after reopening.\n${first}${errors}\n${second}${reopened_errors}")

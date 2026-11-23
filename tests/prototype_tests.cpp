@@ -19,7 +19,7 @@ public:
         return {processing_, processing_ == ProcessingType::Local ? "test-local" : "test-remote"};
     }
 
-    Result<ProposedCitation> generate(const Question&, std::span<const Chunk>) override {
+    Result<ProposedCitation> generate(const GenerationRequest&) override {
         ++calls_;
         return proposal_;
     }

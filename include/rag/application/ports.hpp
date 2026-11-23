@@ -95,6 +95,48 @@ struct ProposedCitation {
     DocumentId documentId = 0;
     std::optional<std::size_t> page = {};
     std::optional<DocxPosition> docx = {};
+    bool fromCache = false;
+
+    static ProposedCitation fromChunk(const Chunk& chunk, bool cached = false) {
+        return {chunk.line(), chunk.text(), chunk.documentId(), chunk.page(), chunk.docx(), cached};
+    }
+};
+
+struct GenerationRequest {
+    const Question& question;
+    const IndexRevision& revision;
+    const ModelProfile& profile;
+    std::span<const Chunk> evidence;
+};
+
+struct ChunkReference {
+    DocumentId documentId;
+    std::size_t line;
+};
+
+class IAnswerCacheStore {
+public:
+    virtual ~IAnswerCacheStore() = default;
+    virtual Result<std::optional<ChunkReference>> lookup(const GenerationRequest& request) const = 0;
+    virtual Result<bool> remember(const GenerationRequest& request, ChunkReference citation) = 0;
+};
+
+struct HistoryEntry {
+    std::string timeUtc;
+    std::string question;
+    IndexRevision revision;
+    ModelProfile profile;
+    Answer answer;
+    bool outdated;
+};
+
+class IHistoryStore {
+public:
+    virtual ~IHistoryStore() = default;
+    virtual Result<bool> appendHistory(const std::string& question, const IndexRevision& revision,
+                                       const ModelProfile& profile, const Answer& answer) = 0;
+    virtual Result<std::vector<HistoryEntry>> history() const = 0;
+    virtual Result<bool> clearHistory() = 0;
 };
 
 class ILlmProvider {
@@ -102,8 +144,7 @@ public:
     virtual ~ILlmProvider() = default;
     // Local metadata for the configured provider, stable throughout an ask operation.
     virtual ModelProfile profile() const = 0;
-    virtual Result<ProposedCitation> generate(const Question& question,
-                                               std::span<const Chunk> evidence) = 0;
+    virtual Result<ProposedCitation> generate(const GenerationRequest& request) = 0;
 };
 
 }  // namespace rag

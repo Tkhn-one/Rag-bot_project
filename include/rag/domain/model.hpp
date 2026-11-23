@@ -52,6 +52,13 @@ enum class ProcessingType { Local, Remote };
 struct ModelProfile {
     ProcessingType processing;
     std::string modelId;
+    std::string generationParameters = "default";
+    std::string responseFormat = "extractive-v1";
+    std::string endpoint = "builtin";
+    // Public configuration identifier rotated when credentials change. Never a secret.
+    std::string credentialScope;
+
+    bool operator==(const ModelProfile&) const = default;
 };
 
 struct TableCell {
@@ -96,7 +103,19 @@ public:
             return AppError::EmptyQuestion;
         }
         const auto end = text.find_last_not_of(" \t\r\n\f\v");
-        return Question(text.substr(start, end - start + 1));
+        std::string normalized;
+        normalized.reserve(end - start + 1);
+        for (auto i = start; i <= end; ++i) {
+            if (text[i] == '\r') {
+                normalized += '\n';
+                if (i < end && text[i + 1] == '\n') {
+                    ++i;
+                }
+            } else {
+                normalized += text[i];
+            }
+        }
+        return Question(std::move(normalized));
     }
 
     const std::string& text() const noexcept { return text_; }
@@ -128,12 +147,15 @@ private:
 class Answer {
 public:
     Answer() = default;
-    explicit Answer(Citation citation) : citation_(std::move(citation)) {}
+    explicit Answer(Citation citation, bool fromCache = false)
+        : citation_(std::move(citation)), fromCache_(fromCache) {}
 
     const std::optional<Citation>& citation() const noexcept { return citation_; }
+    bool fromCache() const noexcept { return fromCache_; }
 
 private:
     std::optional<Citation> citation_;
+    bool fromCache_ = false;
 };
 
 }  // namespace rag

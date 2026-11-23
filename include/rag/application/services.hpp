@@ -22,11 +22,33 @@ private:
     IKnowledgeStore& store_;
 };
 
+class ValidatingLlmProvider final : public ILlmProvider {
+public:
+    explicit ValidatingLlmProvider(ILlmProvider& inner) : inner_(inner) {}
+    ModelProfile profile() const override { return inner_.profile(); }
+    Result<ProposedCitation> generate(const GenerationRequest& request) override;
+
+private:
+    ILlmProvider& inner_;
+};
+
+class CachingLlmProvider final : public ILlmProvider {
+public:
+    CachingLlmProvider(ValidatingLlmProvider& validated, IAnswerCacheStore& cache)
+        : validated_(validated), cache_(cache) {}
+    ModelProfile profile() const override { return validated_.profile(); }
+    Result<ProposedCitation> generate(const GenerationRequest& request) override;
+
+private:
+    ValidatingLlmProvider& validated_;
+    IAnswerCacheStore& cache_;
+};
+
 class RagService {
 public:
     RagService(const IKnowledgeStore& store, const IRetriever& retriever,
-               ILlmProvider& provider)
-        : store_(store), retriever_(retriever), provider_(provider) {}
+               ILlmProvider& provider, IHistoryStore* history = nullptr)
+        : store_(store), retriever_(retriever), provider_(provider), history_(history) {}
 
     Result<Answer> ask(std::string question);
 
@@ -34,6 +56,7 @@ private:
     const IKnowledgeStore& store_;
     const IRetriever& retriever_;
     ILlmProvider& provider_;
+    IHistoryStore* history_;
 };
 
 }  // namespace rag

@@ -106,13 +106,11 @@ class MockProvider final : public ILlmProvider {
 public:
     ModelProfile profile() const override { return {ProcessingType::Local, "mock-extractive-v1"}; }
 
-    Result<ProposedCitation> generate(const Question&,
-                                       std::span<const Chunk> evidence) override {
-        if (evidence.empty()) {
+    Result<ProposedCitation> generate(const GenerationRequest& request) override {
+        if (request.evidence.empty()) {
             return AppError::InvalidCitation;
         }
-        const auto& chunk = evidence.front();
-        return ProposedCitation{chunk.line(), chunk.text(), chunk.documentId(), chunk.page(), chunk.docx()};
+        return ProposedCitation::fromChunk(request.evidence.front());
     }
 };
 

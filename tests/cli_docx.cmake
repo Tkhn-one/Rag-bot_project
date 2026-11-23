@@ -72,7 +72,7 @@ if(CASE STREQUAL "mixed_persistence")
         list(GET questions ${index} question)
         run(after --db "${database}" "${question}")
         if(NOT after_status STREQUAL "0" OR NOT after_errors STREQUAL "" OR
-           NOT after_output STREQUAL before_${index}_output)
+           NOT after_output STREQUAL "Ответ из кэша.\n${before_${index}_output}")
             message(FATAL_ERROR "Citation changed after reopening.\n${after_output}\n${after_errors}")
         endif()
     endforeach()

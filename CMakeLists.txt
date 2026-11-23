@@ -97,6 +97,7 @@ add_library(rag_application src/application/services.cpp)
 target_link_libraries(rag_application PUBLIC rag_domain)
 
 add_library(rag_infrastructure
+    src/infrastructure/cache_key.cpp
     src/infrastructure/txt_reader.cpp
     src/infrastructure/pdf_reader.cpp
     src/infrastructure/docx_reader.cpp
@@ -106,7 +107,7 @@ add_library(rag_infrastructure
     src/infrastructure/utf8.cpp
 )
 target_link_libraries(rag_infrastructure PUBLIC rag_application
-    PRIVATE rag_sqlite rag_pdfium rag_miniz rag_pugixml)
+    PRIVATE rag_sqlite rag_pdfium rag_miniz rag_pugixml bcrypt)
 
 add_executable(rag_cli apps/main.cpp src/presentation/cli.cpp)
 target_link_libraries(rag_cli PRIVATE rag_application rag_infrastructure)
@@ -130,7 +131,7 @@ if(BUILD_TESTING)
     add_executable(rag_sqlite_tests tests/sqlite_tests.cpp)
     target_link_libraries(rag_sqlite_tests PRIVATE rag_infrastructure rag_sqlite)
     foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure
-                          migration_v2 migration_v3 policy_revisions)
+                          migration_v2 migration_v3 migration_v4 policy_revisions cache_history cache_access_errors)
         add_test(NAME sqlite_${case}
                  COMMAND rag_sqlite_tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
                          "${CMAKE_CURRENT_BINARY_DIR}")
@@ -152,6 +153,11 @@ if(BUILD_TESTING)
                      "-DDEMO_DIR=${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
                      "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
                      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_sqlite_persistence.cmake")
+    add_test(NAME cli_history
+             COMMAND "${CMAKE_COMMAND}" "-DCLI=$<TARGET_FILE:rag_cli>"
+                     "-DDEMO_DIR=${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
+                     "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                     -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_history.cmake")
     foreach(case IN ITEMS persistence partial errors)
         add_test(NAME cli_pdf_${case}
                  COMMAND "${CMAKE_COMMAND}" "-DCLI=$<TARGET_FILE:rag_cli>"
