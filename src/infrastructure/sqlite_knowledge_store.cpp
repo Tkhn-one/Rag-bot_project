@@ -1,16 +1,18 @@
 #include "rag/infrastructure/sqlite_knowledge_store.hpp"
 #include "rag/infrastructure/utf8.hpp"
 #include "cache_key.hpp"
+#include "rag/application/block_slices.hpp"
 #include "sqlite_search.hpp"
 #include "sqlite_helpers.hpp"
 
 #include <sqlite3.h>
+#include <algorithm>
 
 namespace rag {
 namespace {
 
 constexpr int applicationId = 0x52414742;  // RAGB
-constexpr int schemaVersion = 6;
+constexpr int schemaVersion = 7;
 constexpr auto createV2Schema = R"sql(
     CREATE TABLE documents (
         id INTEGER PRIMARY KEY,
@@ -83,6 +85,23 @@ constexpr auto addCacheAndHistory = R"sql(
 
 using namespace sql;
 
+constexpr auto addSourceBlocks = R"sql(
+    CREATE TABLE source_blocks (
+        document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        line INTEGER NOT NULL CHECK (line > 0), text TEXT NOT NULL, page INTEGER,
+        docx_part TEXT, docx_paragraph INTEGER, docx_table INTEGER, docx_row INTEGER, docx_cell INTEGER,
+        PRIMARY KEY(document_id,line)
+    ) STRICT, WITHOUT ROWID;
+    INSERT INTO source_blocks SELECT document_id,line,text,page,docx_part,docx_paragraph,docx_table,docx_row,docx_cell FROM chunks;
+    ALTER TABLE chunks ADD COLUMN source_line INTEGER CHECK(source_line > 0);
+    ALTER TABLE chunks ADD COLUMN first_char INTEGER CHECK(first_char > 0);
+    ALTER TABLE chunks ADD COLUMN last_char INTEGER CHECK(last_char >= first_char);
+    ALTER TABLE history ADD COLUMN first_char INTEGER CHECK(first_char > 0);
+    ALTER TABLE history ADD COLUMN last_char INTEGER CHECK(last_char >= first_char);
+    UPDATE search_profile SET settings = settings || '/blocks400-60-v1' WHERE dimension = 0;
+    PRAGMA user_version=7;
+)sql";
+
 struct Schema {
     int application;
     int version;
@@ -122,7 +141,7 @@ std::optional<AppError> initializeSchema(sqlite3* database) {
         }
         if (!execute(database, createV2Schema) || !execute(database, addDocxPositions) ||
             !execute(database, addLibraryMetadata) || !execute(database, addCacheAndHistory) ||
-            !execute(database, createSearchIndex)) {
+            !execute(database, createSearchIndex) || !execute(database, addSourceBlocks)) {
             return databaseError(database, AppError::StoreWriteFailed);
         }
     }
@@ -239,9 +258,17 @@ std::optional<AppError> migrateLegacy(sqlite3* database, const std::filesystem::
             (schema->version <= 2 && !execute(database, addDocxPositions)) ||
             (schema->version <= 3 && !execute(database, addLibraryMetadata)) ||
             (schema->version <= 4 && !execute(database, addCacheAndHistory)) ||
-            !execute(database, createSearchIndex) ||
+            (schema->version <= 5 && !execute(database, createSearchIndex)) ||
+            !execute(database, addSourceBlocks) ||
             (schema->version >= 4 && !execute(database, "UPDATE library SET revision = revision + 1 WHERE id=1"))) {
             return databaseError(database, AppError::StoreMigrationFailed);
+        }
+        auto profile = prepare(database, "SELECT dimension FROM search_profile WHERE id=1");
+        if (!profile || sqlite3_step(profile.get()) != SQLITE_ROW) return AppError::StoreMigrationFailed;
+        // A legacy hybrid index keeps its revision's source data and requires --reindex with its GGUF.
+        if (sqlite3_column_int64(profile.get(), 0) == 0 &&
+            std::holds_alternative<AppError>(rebuildSearchChunks(database, nullptr))) {
+            return AppError::StoreMigrationFailed;
         }
     }
     if (!transaction.commit()) {
@@ -301,6 +328,9 @@ bool advanceRevision(sqlite3* database) {
            sqlite3_changes(database) == 1;
 }
 
+Result<std::size_t> publishBlocks(sqlite3* database, std::optional<sqlite3_int64> document,
+                                  const IEmbeddingProvider* embeddings);
+
 Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
                                   const std::string& content, std::span<const DocumentLine> lines,
                                   DocumentPolicy policy, const std::string& positionLayout,
@@ -321,7 +351,7 @@ Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
 
     const auto id = sqlite3_last_insert_rowid(database);
     const auto chunk = prepare(database, R"sql(
-        INSERT INTO chunks (document_id, line, text, page, docx_part, docx_paragraph,
+        INSERT INTO source_blocks (document_id, line, text, page, docx_part, docx_paragraph,
                             docx_table, docx_row, docx_cell)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
     )sql");
@@ -336,17 +366,13 @@ Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
             sqlite3_reset(chunk.get()) != SQLITE_OK) {
             return databaseError(database, AppError::StoreWriteFailed);
         }
-        if (embeddings) {
-            const auto indexed = indexVector(database, *embeddings, id, line.number, line.text);
-            if (const auto* error = std::get_if<AppError>(&indexed)) {
-                return *error;
-            }
-        }
     }
+    const auto published = publishBlocks(database, id, embeddings);
+    if (std::holds_alternative<AppError>(published)) return published;
     if (!advanceRevision(database)) {
         return databaseError(database, AppError::StoreWriteFailed);
     }
-    return lines.size();
+    return published;
 }
 
 Result<bool> changePolicy(sqlite3* database, sqlite3_int64 id, DocumentPolicy policy,
@@ -383,7 +409,7 @@ std::optional<std::size_t> readPositionNumber(sqlite3_stmt* query, int column) {
 }
 
 // Both chunks and historical citations select line, text, page and DOCX coordinates in this order.
-Result<Chunk> readChunk(sqlite3_stmt* query, DocumentId id) {
+Result<Chunk> readChunk(sqlite3_stmt* query, DocumentId id, std::size_t chunkId = 0, int rangeColumn = -1) {
     const auto line = sqlite3_column_int64(query, 0);
     auto text = readText(query, 1);
     if (!text || line <= 0 || !std::in_range<std::size_t>(line)) {
@@ -411,7 +437,60 @@ Result<Chunk> readChunk(sqlite3_stmt* query, DocumentId id) {
             docx = DocxPosition{std::move(*part), TableCell{*table, *row, *cell}};
         }
     }
-    return Chunk(id, static_cast<std::size_t>(line), std::move(*text), page, std::move(docx));
+    std::optional<CharacterRange> range;
+    if (rangeColumn >= 0 && sqlite3_column_type(query, rangeColumn) != SQLITE_NULL) {
+        const auto first = readPositionNumber(query, rangeColumn);
+        const auto last = readPositionNumber(query, rangeColumn + 1);
+        if (!first || !last || *last < *first) return AppError::StoreCorrupt;
+        range = CharacterRange{*first, *last};
+    }
+    return Chunk(id, static_cast<std::size_t>(line), std::move(*text), page, std::move(docx), chunkId, range);
+}
+
+Result<std::size_t> publishBlocks(sqlite3* db, std::optional<sqlite3_int64> document,
+                                  const IEmbeddingProvider* embeddings) {
+    std::string select = "SELECT line,text,page,docx_part,docx_paragraph,docx_table,docx_row,docx_cell,document_id "
+                         "FROM source_blocks ";
+    if (document) select += "WHERE document_id=?1 ";
+    select += "ORDER BY document_id,line";
+    auto rows = prepare(db, select.c_str());
+    auto insert = prepare(db, R"sql(
+        INSERT INTO chunks (document_id,line,text,page,docx_part,docx_paragraph,docx_table,docx_row,docx_cell,
+                            source_line,first_char,last_char) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+    )sql");
+    if (!rows || !insert || (document && sqlite3_bind_int64(rows.get(), 1, *document) != SQLITE_OK))
+        return AppError::StoreWriteFailed;
+    std::size_t count = 0, chunkId = 0;
+    sqlite3_int64 previousDocument = 0;
+    int status;
+    while ((status = sqlite3_step(rows.get())) == SQLITE_ROW) {
+        const auto id = sqlite3_column_int64(rows.get(), 8);
+        const auto source = readChunk(rows.get(), static_cast<DocumentId>(id));
+        if (const auto* error = std::get_if<AppError>(&source)) return *error;
+        const auto& block = std::get<Chunk>(source);
+        const auto slices = splitBlock(block.text(), embeddings);
+        if (const auto* error = std::get_if<AppError>(&slices)) return *error;
+        if (previousDocument != id) chunkId = 0;
+        previousDocument = id;
+        for (const auto& piece : std::get<std::vector<BlockSlice>>(slices)) {
+            chunkId = std::max(chunkId + 1, block.line());
+            auto* row = insert.get();
+            const auto& range = piece.characters;
+            if (sqlite3_bind_int64(row, 1, id) != SQLITE_OK || !bindPositionNumber(row, 2, chunkId) ||
+                !bindText(row, 3, piece.text) || !bindPositionNumber(row, 4, block.page()) ||
+                !bindDocxPosition(row, 5, block.docx()) || !bindPositionNumber(row, 10, block.line()) ||
+                !bindPositionNumber(row, 11, range ? std::optional(range->first) : std::nullopt) ||
+                !bindPositionNumber(row, 12, range ? std::optional(range->last) : std::nullopt) ||
+                sqlite3_step(row) != SQLITE_DONE || sqlite3_reset(row) != SQLITE_OK) return AppError::StoreWriteFailed;
+            if (embeddings) {
+                const auto indexed = indexVector(db, *embeddings, id, chunkId, piece.text);
+                if (const auto* error = std::get_if<AppError>(&indexed)) return *error;
+            }
+            ++count;
+        }
+    }
+    if (status != SQLITE_DONE) return AppError::StoreReadFailed;
+    return count;
 }
 
 Result<std::vector<Chunk>> readChunks(sqlite3* database, sqlite3_stmt* query, sqlite3_int64 id) {
@@ -421,7 +500,9 @@ Result<std::vector<Chunk>> readChunks(sqlite3* database, sqlite3_stmt* query, sq
     std::vector<Chunk> chunks;
     int status = SQLITE_OK;
     while ((status = sqlite3_step(query)) == SQLITE_ROW) {
-        auto chunk = readChunk(query, static_cast<DocumentId>(id));
+        const auto key = readPositionNumber(query, 8);
+        if (!key) return AppError::StoreCorrupt;
+        auto chunk = readChunk(query, static_cast<DocumentId>(id), *key, 9);
         if (const auto* error = std::get_if<AppError>(&chunk)) {
             return *error;
         }
@@ -437,6 +518,14 @@ Result<std::vector<Chunk>> readChunks(sqlite3* database, sqlite3_stmt* query, sq
 }
 
 }  // namespace
+
+Result<bool> rebuildSearchChunks(sqlite3* db, const IEmbeddingProvider* provider) {
+    // Foreign keys remove vectors and cache references together with their old chunk IDs.
+    if (!sql::execute(db, "DELETE FROM chunks_fts; DELETE FROM chunks")) return AppError::StoreWriteFailed;
+    const auto published = publishBlocks(db, {}, provider);
+    if (const auto* error = std::get_if<AppError>(&published)) return *error;
+    return true;
+}
 
 void SqliteKnowledgeStore::CloseDatabase::operator()(sqlite3* database) const noexcept {
     sqlite3_close(database);
@@ -575,7 +664,8 @@ Result<LibrarySnapshot> SqliteKnowledgeStore::snapshot() const {
     const auto documents = prepare(database,
         "SELECT id, source, content, policy, position_layout FROM documents ORDER BY id");
     const auto chunks = prepare(database, R"sql(
-        SELECT line, text, page, docx_part, docx_paragraph, docx_table, docx_row, docx_cell
+        SELECT coalesce(source_line,line), text, page, docx_part, docx_paragraph, docx_table, docx_row, docx_cell,
+               line, first_char, last_char
         FROM chunks WHERE document_id = ?1 ORDER BY line
     )sql");
     if (!documents || !chunks) {
@@ -638,7 +728,7 @@ Result<bool> SqliteKnowledgeStore::remember(const GenerationRequest& request, Ch
                                   " ON CONFLICT(key) DO NOTHING");
     if (!key || !stmt || sqlite3_bind_blob(stmt.get(), 1, key->data(), static_cast<int>(key->size()),
                                           SQLITE_TRANSIENT) != SQLITE_OK ||
-        !bindPositionNumber(stmt.get(), 2, citation.documentId) || !bindPositionNumber(stmt.get(), 3, citation.line) ||
+        !bindPositionNumber(stmt.get(), 2, citation.documentId) || !bindPositionNumber(stmt.get(), 3, citation.chunkId) ||
         sqlite3_step(stmt.get()) != SQLITE_DONE) {
         return databaseError(db, AppError::StoreWriteFailed);
     }
@@ -651,8 +741,8 @@ Result<bool> SqliteKnowledgeStore::appendHistory(const std::string& question, co
     const auto stmt = prepare(db, R"sql(
         INSERT INTO history (question, library_id, revision, processing, model_id, parameters,
             response_format, endpoint, credential_scope, from_cache, document_id, source, line, quote, page,
-            docx_part, docx_paragraph, docx_table, docx_row, docx_cell)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            docx_part, docx_paragraph, docx_table, docx_row, docx_cell, first_char, last_char)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
     )sql");
     auto* row = stmt.get();
     if (!row || !bindText(row, 1, question) || !bindText(row, 2, revision.libraryId) ||
@@ -665,7 +755,10 @@ Result<bool> SqliteKnowledgeStore::appendHistory(const std::string& question, co
         return databaseError(db, AppError::StoreWriteFailed);
     }
     if (const auto& c = answer.citation()) {
+        const auto range = c->characters();
         if (!bindPositionNumber(row, 11, c->documentId()) || !bindText(row, 12, c->source()) ||
+            !bindPositionNumber(row, 21, range ? std::optional(range->first) : std::nullopt) ||
+            !bindPositionNumber(row, 22, range ? std::optional(range->last) : std::nullopt) ||
             !bindPositionNumber(row, 13, c->line()) || !bindText(row, 14, c->quote()) ||
             !bindPositionNumber(row, 15, c->page()) || !bindDocxPosition(row, 16, c->docx())) {
             return databaseError(db, AppError::StoreWriteFailed);
@@ -683,7 +776,7 @@ Result<std::vector<HistoryEntry>> SqliteKnowledgeStore::history() const {
         SELECT h.line, h.quote, h.page, h.docx_part, h.docx_paragraph, h.docx_table, h.docx_row, h.docx_cell,
                h.document_id, h.source, h.from_cache, h.time_utc, h.question, h.library_id, h.revision,
                h.processing, h.model_id, h.parameters, h.response_format, h.endpoint, h.credential_scope,
-               h.library_id <> lib.library_id OR h.revision <> lib.revision
+               h.library_id <> lib.library_id OR h.revision <> lib.revision, h.first_char, h.last_char
         FROM history h CROSS JOIN library lib WHERE lib.id = 1 ORDER BY h.id
     )sql");
     auto* row = stmt.get();
@@ -700,7 +793,7 @@ Result<std::vector<HistoryEntry>> SqliteKnowledgeStore::history() const {
             if (!id || !source) {
                 return AppError::StoreCorrupt;
             }
-            auto chunk = readChunk(row, *id);
+            auto chunk = readChunk(row, *id, 0, 22);
             if (const auto* error = std::get_if<AppError>(&chunk)) {
                 return *error;
             }

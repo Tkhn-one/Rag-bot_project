@@ -3,6 +3,7 @@
 #include "rag/domain/model.hpp"
 #include <sqlite3.h>
 #include <memory>
+#include <string_view>
 
 namespace rag::sql {
 
@@ -64,8 +65,8 @@ inline std::optional<std::string> readText(sqlite3_stmt* statement, int column) 
                        static_cast<std::size_t>(sqlite3_column_bytes(statement, column)));
 }
 
-inline bool bindText(sqlite3_stmt* statement, int index, const std::string& text) {
-    return sqlite3_bind_text64(statement, index, text.data(), text.size(), SQLITE_TRANSIENT,
+inline bool bindText(sqlite3_stmt* statement, int index, std::string_view text) {
+    return sqlite3_bind_text64(statement, index, text.empty() ? "" : text.data(), text.size(), SQLITE_TRANSIENT,
                                SQLITE_UTF8) == SQLITE_OK;
 }
 

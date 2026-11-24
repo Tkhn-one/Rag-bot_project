@@ -54,6 +54,13 @@ public:
         return std::string("qwen3:b6500:last:eos:l2:ctx2048:retrieval-en-v1:") + weightsHash;
     }
     std::size_t dimension() const override { return 1024; }
+    Result<std::size_t> documentTokenCount(std::string_view text) const override {
+        if (!std::in_range<int32_t>(text.size())) return AppError::EmbeddingFailed;
+        const auto* vocab = llama_model_get_vocab(model_.get());
+        const auto needed = llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()), nullptr, 0, true, false);
+        if (needed >= 0 || needed == INT32_MIN) return AppError::EmbeddingFailed;
+        return static_cast<std::size_t>(-needed) + (llama_vocab_get_add_eos(vocab) ? 0 : 1);
+    }
     Result<std::vector<float>> embed(std::string_view text, EmbeddingInput input) const override {
         std::string prompt;
         if (input == EmbeddingInput::Query)

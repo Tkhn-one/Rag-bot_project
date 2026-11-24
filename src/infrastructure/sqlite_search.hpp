@@ -27,6 +27,8 @@ inline constexpr auto createSearchIndex = R"sql(
 )sql";
 
 Result<bool> searchProfileMatches(sqlite3* db, const IEmbeddingProvider* provider, SearchSettings settings);
+// Caller holds the publication transaction. Re-slice the original blocks with the selected tokenizer.
+Result<bool> rebuildSearchChunks(sqlite3* db, const IEmbeddingProvider* provider);
 Result<bool> indexVector(sqlite3* db, const IEmbeddingProvider& provider, std::int64_t id,
                          std::size_t line, std::string_view text);
 

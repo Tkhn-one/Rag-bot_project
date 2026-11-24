@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rag/application/ports.hpp"
+#include "rag/application/block_slices.hpp"
 
 #include <algorithm>
 #include <random>
@@ -55,13 +56,19 @@ public:
         const DocumentId id = documents_.size() + 1;
         std::vector<Chunk> chunks;
         chunks.reserve(lines.size());
-        for (auto& line : lines) {
-            chunks.emplace_back(id, line.number, std::move(line.text), line.page, std::move(line.docx));
+        std::size_t chunkId = 0;
+        for (const auto& line : lines) {
+            const auto slices = splitBlock(line.text, nullptr);
+            if (const auto* error = std::get_if<AppError>(&slices)) return *error;
+            for (const auto& piece : std::get<std::vector<BlockSlice>>(slices)) {
+                chunkId = std::max(chunkId + 1, line.number);
+                chunks.emplace_back(id, line.number, std::string(piece.text), line.page, line.docx, chunkId, piece.characters);
+            }
         }
         documents_.emplace_back(id, std::move(source), std::move(content), std::move(chunks),
                                 policy, std::move(positionLayout));
         ++revision_.number;
-        return lines.size();
+        return documents_.back().chunks().size();
     }
 
     Result<LibrarySnapshot> snapshot() const override {

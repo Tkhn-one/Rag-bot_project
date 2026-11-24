@@ -21,6 +21,8 @@ void appendDocxLayout(std::string& layout, const DocxPosition& position, std::si
 auto findCitation(std::span<const Chunk> evidence, const ProposedCitation& citation) {
     return std::ranges::find_if(evidence, [&](const Chunk& chunk) {
         return chunk.documentId() == citation.documentId && chunk.line() == citation.line &&
+               chunk.chunkId() == (citation.chunkId ? citation.chunkId : citation.line) &&
+               chunk.characters() == citation.characters &&
                chunk.page() == citation.page && chunk.docx() == citation.docx &&
                chunk.text() == citation.quote;
     });
@@ -103,10 +105,11 @@ Result<ImportReport> IndexingService::import(const std::filesystem::path& path) 
 Result<ProposedCitation> ValidatingLlmProvider::generate(const GenerationRequest& request) {
     auto result = inner_.generate(request);
     if (auto* citation = std::get_if<ProposedCitation>(&result)) {
-        if (findCitation(request.evidence, *citation) == request.evidence.end()) {
+        const auto match = findCitation(request.evidence, *citation);
+        if (match == request.evidence.end()) {
             return AppError::InvalidCitation;
         }
-        citation->fromCache = false;
+        *citation = ProposedCitation::fromChunk(*match);
     }
     return result;
 }
@@ -118,7 +121,7 @@ Result<ProposedCitation> CachingLlmProvider::generate(const GenerationRequest& r
     }
     if (const auto& ref = std::get<std::optional<ChunkReference>>(cached)) {
         const auto match = std::ranges::find_if(request.evidence, [&](const Chunk& chunk) {
-            return chunk.documentId() == ref->documentId && chunk.line() == ref->line;
+            return chunk.documentId() == ref->documentId && chunk.chunkId() == ref->chunkId;
         });
         if (match == request.evidence.end()) {
             return AppError::StoreCorrupt;
@@ -128,7 +131,7 @@ Result<ProposedCitation> CachingLlmProvider::generate(const GenerationRequest& r
 
     auto result = validated_.generate(request);
     if (const auto* citation = std::get_if<ProposedCitation>(&result)) {
-        const auto saved = cache_.remember(request, {citation->documentId, citation->line});
+        const auto saved = cache_.remember(request, {citation->documentId, citation->chunkId});
         if (const auto* error = std::get_if<AppError>(&saved)) {
             return *error;
         }

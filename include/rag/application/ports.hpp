@@ -90,6 +90,8 @@ public:
     virtual ~IEmbeddingProvider() = default;
     virtual std::string profileId() const = 0;
     virtual std::size_t dimension() const = 0;
+    // Token budget for embedding a document slice, including any model delimiters.
+    virtual Result<std::size_t> documentTokenCount(std::string_view text) const = 0;
     virtual Result<std::vector<float>> embed(std::string_view text, EmbeddingInput input) const = 0;
 };
 
@@ -113,9 +115,12 @@ struct ProposedCitation {
     std::optional<std::size_t> page = {};
     std::optional<DocxPosition> docx = {};
     bool fromCache = false;
+    std::optional<CharacterRange> characters = {};
+    std::size_t chunkId = 0;
 
     static ProposedCitation fromChunk(const Chunk& chunk, bool cached = false) {
-        return {chunk.line(), chunk.text(), chunk.documentId(), chunk.page(), chunk.docx(), cached};
+        return {chunk.line(), chunk.text(), chunk.documentId(), chunk.page(), chunk.docx(), cached,
+                chunk.characters(), chunk.chunkId()};
     }
 };
 
@@ -128,7 +133,7 @@ struct GenerationRequest {
 
 struct ChunkReference {
     DocumentId documentId;
-    std::size_t line;
+    std::size_t chunkId;
 };
 
 class IAnswerCacheStore {

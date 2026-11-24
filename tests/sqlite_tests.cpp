@@ -1,5 +1,6 @@
 #include "rag/application/services.hpp"
 #include "rag/infrastructure/adapters.hpp"
+#include "rag/infrastructure/local_embeddings.hpp"
 #include "rag/infrastructure/sqlite_knowledge_store.hpp"
 #include "rag/infrastructure/utf8.hpp"
 
@@ -345,7 +346,7 @@ void migrate(const fs::path& directory) {
     createLegacyLibrary(path);
     const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 6, "opened database must advance to v6");
+    require(fixtureScalar(path, "PRAGMA user_version") == 7, "opened database must advance to v7");
     require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
                 fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
             "backup must retain the v1 schema, document ID and line");
@@ -403,7 +404,7 @@ void migratePdfEra(const fs::path& directory) {
             (42, 1, 'Orion snapshot runs every Friday.', 2);
     )sql");
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 6, "v2 must advance to v6");
+    require(fixtureScalar(path, "PRAGMA user_version") == 7, "v2 must advance to v7");
     const auto backup = directory / "pdf-era.sqlite.v2-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 2 &&
                 fixtureScalar(backup, "SELECT page FROM chunks WHERE document_id = 42") == 2,
@@ -444,7 +445,7 @@ void migrateDocxEra(const fs::path& directory) {
     const auto backup = directory / "docx-era.sqlite.v3-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 3 &&
                 fixtureScalar(backup, "SELECT docx_row FROM chunks WHERE document_id = 17 AND line = 2") == 2 &&
-                fixtureScalar(path, "PRAGMA user_version") == 6, "migration must preserve a readable v3 backup");
+                fixtureScalar(path, "PRAGMA user_version") == 7, "migration must preserve a readable v3 backup");
     const auto snapshot = requireValue(store->snapshot(), "reading migrated v3 library");
     require(snapshot.revision.number == 0 && snapshot.policy == DocumentPolicy::LocalOnly &&
                 snapshot.documents.size() == 1, "migration starts a closed library at its baseline revision");
@@ -480,15 +481,22 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int ver
                     "old keyword profile must have its own completed answer");
         }
     }
-    executeFixtureSql(path, "DROP TRIGGER index_chunk; DROP TABLE chunks_fts; DROP TABLE embeddings; DROP TABLE search_profile");
-    executeFixtureSql(path, version == 4 ? "DROP TABLE answer_cache; DROP TABLE history; PRAGMA user_version = 4"
-                                         : "PRAGMA user_version = 5");
+    executeFixtureSql(path, "DROP TABLE source_blocks; ALTER TABLE chunks DROP COLUMN last_char;"
+                            "ALTER TABLE chunks DROP COLUMN first_char; ALTER TABLE chunks DROP COLUMN source_line;"
+                            "ALTER TABLE history DROP COLUMN last_char; ALTER TABLE history DROP COLUMN first_char;");
+    if (version <= 5) {
+        executeFixtureSql(path, "DROP TRIGGER index_chunk; DROP TABLE chunks_fts; DROP TABLE embeddings; DROP TABLE search_profile");
+        executeFixtureSql(path, version == 4 ? "DROP TABLE answer_cache; DROP TABLE history; PRAGMA user_version = 4"
+                                             : "PRAGMA user_version = 5");
+    } else {
+        executeFixtureSql(path, "UPDATE search_profile SET settings='unicode61-bm25-cos-rrf-v1/20/60/8/2'; PRAGMA user_version=6");
+    }
     const auto migrated = openStore(path);
     const auto backup = directory / ("revision-era.sqlite.v" + std::to_string(version) + "-backup") / "library.sqlite";
-    ++previous.number;  // Moving from KeywordRetriever to BM25 changes the index.
+    ++previous.number;  // Migration publishes a new index format.
     require(fixtureScalar(backup, "PRAGMA user_version") == version &&
                 fixtureScalar(backup, "SELECT count(*) FROM documents") == 1 &&
-                fixtureScalar(path, "PRAGMA user_version") == 6 &&
+                fixtureScalar(path, "PRAGMA user_version") == 7 &&
                 fixtureScalar(path, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'копирование'") == 1 &&
                 requireValue(migrated->snapshot(), "reading the migrated revision").revision == previous,
             "migration must back up the database, populate FTS and publish a new revision");
@@ -656,7 +664,10 @@ public:
     bool fail = false;
     std::string profileId() const override { return id; }
     std::size_t dimension() const override { return 2; }
-    Result<std::vector<float>> embed(std::string_view text, EmbeddingInput) const override {
+    Result<std::size_t> documentTokenCount(std::string_view text) const override { return text.size(); }
+    Result<std::vector<float>> embed(std::string_view text, EmbeddingInput input) const override {
+        if (input == EmbeddingInput::Document && text.size() > 400) return AppError::EmbeddingFailed;
+        if (text.ends_with("TailMarker")) return std::vector<float>{1, 0};
         if (fail && text == "Archive") return AppError::EmbeddingFailed;
         if (text == "Archive" || text == "restore point") return std::vector<float>{3, 0};
         if (text == "needle" || text.ends_with(" C")) return std::vector<float>{1, 0};
@@ -665,6 +676,125 @@ public:
         return std::vector<float>{0, 5};
     }
 };
+
+void longBlocks(const fs::path& directory, const IEmbeddingProvider& model) {
+    const auto path = directory / "long.sqlite";
+    const auto file = directory / "long.txt";
+    std::string line = "🙂 ";
+    for (int i = 0; i < 2300; ++i) line += "данные ";
+    line += "TailMarker";
+    require(requireValue(model.documentTokenCount(line), "measuring input") > 2048,
+            "the regression fixture must exceed the original runtime limit");
+    writeFixture(file, "intro\r\n\r\n" + line + "\r\nafter");
+    const TxtReader reader;
+    auto store = openStore(path);
+    requireValue(store->configureSearch(&model), "starting hybrid search");
+    const auto report = requireValue(IndexingService(reader, *store).import(file), "importing the long TXT");
+    const auto snapshot = requireValue(store->snapshot(), "reading long TXT");
+    const auto& pieces = snapshot.documents.at(0).chunks();
+    require(report.chunks == pieces.size() && pieces.size() > 3 && pieces.front().line() == 1 &&
+            pieces.back().line() == 4 && !pieces.back().characters(), "neighbouring source lines must stay intact");
+    std::size_t covered = 0;
+    for (std::size_t i = 1; i + 1 < pieces.size(); ++i) {
+        const auto& piece = pieces[i];
+        const auto range = piece.characters();
+        require(piece.line() == 3 && piece.chunkId() > pieces[i - 1].chunkId() && range &&
+                range->first <= covered + 1 && range->last > covered, "source ranges must cover the line in order");
+        require(requireValue(model.documentTokenCount(piece.text()), "counting slice tokens") <= 400,
+                "slice exceeds token budget");
+        if (covered) {
+            require(range->first <= covered, "expected overlap inside this long block");
+            const auto overlapChars = covered - range->first + 1;
+            const auto overlap = decodeUtf8(piece.text()).value().substr(0, overlapChars); // BMP in this fixture's overlap
+            require(requireValue(model.documentTokenCount(encodeUtf8(overlap).value()), "counting overlap") <= 60,
+                    "overlap exceeds token budget");
+        }
+        covered = range->last;
+    }
+    // SQLite length/substr count Unicode scalar values independently of the C++ splitter.
+    require(fixtureScalar(path, "SELECT length(text) FROM source_blocks WHERE line=3") == covered &&
+            fixtureScalar(path, "SELECT count(*) FROM chunks c JOIN source_blocks b ON b.document_id=c.document_id "
+                                "AND b.line=c.source_line WHERE c.first_char IS NOT NULL AND "
+                                "c.text <> substr(b.text,c.first_char,c.last_char-c.first_char+1)") == 0,
+            "every quoted range must select exactly the original UTF-8 substring");
+    require(fixtureScalar(path, "SELECT count(*) FROM embeddings") == pieces.size() &&
+            fixtureScalar(path, "SELECT count(*) FROM chunks_fts") == pieces.size(), "every slice must be searchable");
+    auto askTail = [&] {
+        MockProvider mock;
+        ValidatingLlmProvider valid(mock);
+        CachingLlmProvider cached(valid, *store);
+        return requireValue(RagService(*store, *store, cached, store.get()).ask("TailMarker"), "asking for the tail");
+    };
+    const auto first = askTail();
+    require(first.citation() && first.citation()->line() == 3 && first.citation()->quote().ends_with("TailMarker") &&
+            first.citation()->characters() == pieces[pieces.size() - 2].characters(), "wrong tail citation");
+    store.reset();
+    store = openStore(path);
+    requireValue(store->configureSearch(&model), "reopening the same profile");
+    const auto second = askTail();
+    const auto history = requireValue(store->history(), "reading history after restart");
+    require(second.fromCache() && second.citation() && second.citation()->characters() == first.citation()->characters() &&
+            history.at(0).answer.citation() && history.at(0).answer.citation()->characters() == first.citation()->characters() &&
+            history.at(0).answer.citation()->quote() == first.citation()->quote(), "tail citation changed after reopening");
+    requireValue(store->configureSearch(nullptr, {}, true), "reindexing with FTS alone");
+    require(fixtureScalar(path, "SELECT count(*) FROM source_blocks") == 3 &&
+            fixtureScalar(path, "SELECT max(last_char) = (SELECT length(text) FROM source_blocks WHERE line=3) "
+                                "FROM chunks WHERE source_line=3") == 1, "reindex must start from intact source blocks");
+}
+
+void splitPositions(const fs::path& directory) {
+    auto store = openStore(directory / "positions.sqlite");
+    const DocxPosition cell{"word/document.xml", TableCell{2, 3, 4}};
+    const std::string block(900, 'x');
+    requireValue(store->save("source.pdf", block, {{7, block, 2}}, DocumentPolicy::LocalOnly), "splitting PDF");
+    requireValue(store->save("source.docx", block, {{9, block, {}, cell}}, DocumentPolicy::LocalOnly, "cell"),
+                 "splitting DOCX");
+    store.reset();
+    store = openStore(directory / "positions.sqlite");
+    const auto snapshot = requireValue(store->snapshot(), "reopening split positions");
+    for (const auto& doc : snapshot.documents) {
+        require(doc.chunks().size() == 3, "unexpected FTS-only slice count");
+        for (const auto& chunk : doc.chunks()) {
+            require(chunk.characters() && (doc.id() == 1 ? chunk.page() == 2 && chunk.line() == 7 :
+                    chunk.docx() == cell && chunk.line() == 9), "lost the source page or DOCX anchor");
+        }
+    }
+}
+
+void labelledContext(const fs::path& directory, const fs::path& demo, const IEmbeddingProvider& model) {
+    auto store = openStore(directory / "context.sqlite");
+    requireValue(store->configureSearch(&model), "activating Qwen");
+    const TxtReader txt;
+    const PdfReader pdf;
+    const DocxReader docx;
+    IndexingService index(txt, *store);
+    requireValue(index.import(demo / "contract.txt"), "importing contract");
+    requireValue(index.import(demo / "decisions.txt"), "importing decisions");
+    struct Label { const char* question; DocumentId document; std::size_t line; };
+    const Label labels[] = {
+        {"Резервное копирование", 2, 4}, {"В какой день делают страховочную копию данных проекта?", 2, 4},
+        {"Каков срок приёмки результата?", 1, 4}, {"Что решили о переносе обучения?", 1, 5}
+    };
+    for (const int documents : {2, 4}) {
+        if (documents == 4) {
+            requireValue(IndexingService(pdf, *store).import(demo / "backup-protocol.pdf"), "importing PDF");
+            requireValue(IndexingService(docx, *store).import(demo / "backup-register.docx"), "importing DOCX");
+        }
+        const auto snapshot = requireValue(store->snapshot(), "reading labelled corpus");
+        for (const auto& label : labels) {
+            const auto query = requireValue(Question::fromText(label.question), "creating labelled query");
+            const auto context = requireValue(store->retrieve(query, snapshot), "retrieving labelled evidence");
+            const auto found = std::ranges::find_if(context, [&](const Chunk& c) {
+                return c.documentId() == label.document && c.line() == label.line;
+            });
+            std::cout << documents << " documents, target " << label.document << ':' << label.line << " rank ";
+            if (found == context.end()) std::cout << "missing";
+            else std::cout << (1 + (found - context.begin()));
+            std::cout << '/' << context.size() << '\n';
+            require(found != context.end(), "the labelled source was absent from the retrieval context");
+        }
+    }
+}
 
 void reciprocalRankFusion(const fs::path& directory) {
     auto store = openStore(directory / "fusion.sqlite");
@@ -748,7 +878,7 @@ void hybridSearch(const fs::path& directory) {
 }  // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
-    if (argc != 4) {
+    if (argc != 4 && argc != 5) {
         return 2;
     }
     try {
@@ -774,6 +904,16 @@ int wmain(int argc, wchar_t* argv[]) {
             migrateRevisionEra(directory.path(), argv[2], 4);
         } else if (test == L"migration_v5") {
             migrateRevisionEra(directory.path(), argv[2], 5);
+        } else if (test == L"migration_v6") {
+            migrateRevisionEra(directory.path(), argv[2], 6);
+        } else if (test == L"long_blocks") {
+            longBlocks(directory.path(), FixtureEmbeddings{});
+        } else if (test == L"split_positions") {
+            splitPositions(directory.path());
+        } else if (test == L"real_chunks" && argc == 5) {
+            const auto model = requireValue(openLocalEmbeddings(argv[4]), "loading local GGUF");
+            longBlocks(directory.path(), *model);
+            labelledContext(directory.path(), argv[2], *model);
         } else if (test == L"hybrid_search") {
             hybridSearch(directory.path());
         } else if (test == L"rrf") {

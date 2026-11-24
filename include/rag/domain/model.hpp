@@ -76,12 +76,22 @@ struct DocxPosition {
     bool operator==(const DocxPosition&) const = default;
 };
 
+// One-based, inclusive Unicode scalar positions within the extracted source block.
+struct CharacterRange {
+    std::size_t first, last;
+    bool operator==(const CharacterRange&) const = default;
+};
+
 class Chunk {
 public:
     Chunk(DocumentId documentId, std::size_t line, std::string text,
-          std::optional<std::size_t> page = {}, std::optional<DocxPosition> docx = {})
+          std::optional<std::size_t> page = {}, std::optional<DocxPosition> docx = {},
+          std::size_t chunkId = 0, std::optional<CharacterRange> characters = {})
         : documentId_(documentId), line_(line), text_(std::move(text)), page_(page),
-          docx_(std::move(docx)) {}
+          docx_(std::move(docx)), chunkId_(chunkId ? chunkId : line), characters_(characters) {}
+
+    std::size_t chunkId() const noexcept { return chunkId_; }
+    std::optional<CharacterRange> characters() const noexcept { return characters_; }
 
     DocumentId documentId() const noexcept { return documentId_; }
     std::size_t line() const noexcept { return line_; }
@@ -95,6 +105,8 @@ private:
     std::string text_;
     std::optional<std::size_t> page_;
     std::optional<DocxPosition> docx_;
+    std::size_t chunkId_;
+    std::optional<CharacterRange> characters_;
 };
 
 class Question {
@@ -135,6 +147,7 @@ public:
     const std::string& source() const noexcept { return source_; }
     DocumentId documentId() const noexcept { return chunk_.documentId(); }
     std::size_t line() const noexcept { return chunk_.line(); }
+    std::optional<CharacterRange> characters() const noexcept { return chunk_.characters(); }
     std::optional<std::size_t> page() const noexcept { return chunk_.page(); }
     const std::optional<DocxPosition>& docx() const noexcept { return chunk_.docx(); }
     const std::string& quote() const noexcept { return chunk_.text(); }

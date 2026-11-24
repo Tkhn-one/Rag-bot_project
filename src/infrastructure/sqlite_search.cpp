@@ -21,7 +21,7 @@ bool higher(const Ranked& a, const Ranked& b) {
 
 std::string settingsId(SearchSettings s) {
     return "unicode61-bm25-cos-rrf-v1/" + std::to_string(s.candidates) + "/" + std::to_string(s.rrfConstant) +
-           "/" + std::to_string(s.contextLimit) + "/" + std::to_string(s.perDocument);
+           "/" + std::to_string(s.contextLimit) + "/" + std::to_string(s.perDocument) + "/blocks400-60-v1";
 }
 
 Result<std::vector<float>> normalized(const IEmbeddingProvider& provider, std::string_view text, EmbeddingInput input) {
@@ -188,21 +188,8 @@ Result<bool> SqliteKnowledgeStore::configureSearch(const IEmbeddingProvider* pro
         auto hasChunks = sql::prepare(db, "SELECT EXISTS(SELECT 1 FROM chunks)");
         if (!hasChunks || sqlite3_step(hasChunks.get()) != SQLITE_ROW) return AppError::StoreReadFailed;
         if (!rebuild && sqlite3_column_int(hasChunks.get(), 0)) return AppError::SearchProfileMismatch;
-        if (!sql::execute(db, "DELETE FROM chunks_fts; INSERT INTO chunks_fts(text, document_id,line) "
-                              "SELECT text,document_id,line FROM chunks; DELETE FROM embeddings")) return AppError::StoreWriteFailed;
-        if (provider) {
-            auto rows = sql::prepare(db, "SELECT document_id,line,text FROM chunks ORDER BY document_id,line");
-            if (!rows) return AppError::StoreReadFailed;
-            int status;
-            while ((status = sqlite3_step(rows.get())) == SQLITE_ROW) {
-                auto text = sql::readText(rows.get(), 2);
-                if (!text) return AppError::StoreCorrupt;
-                auto indexed = indexVector(db, *provider, sqlite3_column_int64(rows.get(), 0),
-                                           sqlite3_column_int64(rows.get(), 1), *text);
-                if (const auto* error = std::get_if<AppError>(&indexed)) return *error;
-            }
-            if (status != SQLITE_DONE) return AppError::StoreReadFailed;
-        }
+        const auto rebuilt = rebuildSearchChunks(db, provider);
+        if (const auto* error = std::get_if<AppError>(&rebuilt)) return *error;
         auto update = sql::prepare(db, "UPDATE search_profile SET model=?1,dimension=?2,settings=?3 WHERE id=1");
         if (!update || !sql::bindText(update.get(), 1, provider ? provider->profileId() : "") ||
             sqlite3_bind_int64(update.get(), 2, provider ? provider->dimension() : 0) != SQLITE_OK ||
@@ -239,8 +226,8 @@ Result<std::vector<Chunk>> SqliteKnowledgeStore::retrieve(const Question& questi
     for (const auto& [id, line] : fuse(std::get<std::vector<Key>>(lexical), std::get<std::vector<Key>>(semantic), settings_)) {
         const auto doc = std::ranges::lower_bound(library.documents, id, {}, &IndexedDocument::id);
         if (doc == library.documents.end() || doc->id() != id) return AppError::StoreCorrupt;
-        const auto chunk = std::ranges::lower_bound(doc->chunks(), line, {}, &Chunk::line);
-        if (chunk == doc->chunks().end() || chunk->line() != line) return AppError::StoreCorrupt;
+        const auto chunk = std::ranges::lower_bound(doc->chunks(), line, {}, &Chunk::chunkId);
+        if (chunk == doc->chunks().end() || chunk->chunkId() != line) return AppError::StoreCorrupt;
         chunks.push_back(*chunk);
     }
     return chunks;

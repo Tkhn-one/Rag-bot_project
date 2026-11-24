@@ -85,6 +85,10 @@ void printAnswer(const Answer& answer, std::ostream& output) {
     } else {
         output << ", строка " << citation->line();
     }
+    if (const auto range = citation->characters()) {
+        if (citation->page()) output << ", строка " << citation->line();
+        output << ", символы " << range->first << "–" << range->last;
+    }
     output << " (ID документа " << citation->documentId() << ")\n";
 }
 

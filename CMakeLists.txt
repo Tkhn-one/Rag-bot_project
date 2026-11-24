@@ -93,7 +93,7 @@ add_library(rag_domain INTERFACE)
 target_include_directories(rag_domain INTERFACE include)
 target_compile_features(rag_domain INTERFACE cxx_std_20)
 
-add_library(rag_application src/application/services.cpp)
+add_library(rag_application src/application/services.cpp src/application/block_slices.cpp)
 target_link_libraries(rag_application PUBLIC rag_domain)
 
 add_library(rag_infrastructure
@@ -150,11 +150,18 @@ if(BUILD_TESTING)
     add_executable(rag_sqlite_tests tests/sqlite_tests.cpp)
     target_link_libraries(rag_sqlite_tests PRIVATE rag_infrastructure rag_sqlite)
     foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure
-                          migration_v2 migration_v3 migration_v4 migration_v5 policy_revisions cache_history cache_access_errors hybrid_search rrf)
+                          migration_v2 migration_v3 migration_v4 migration_v5 migration_v6 policy_revisions
+                          cache_history cache_access_errors hybrid_search rrf long_blocks split_positions)
         add_test(NAME sqlite_${case}
                  COMMAND rag_sqlite_tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
                          "${CMAKE_CURRENT_BINARY_DIR}")
     endforeach()
+
+    set(RAG_TEST_EMBEDDING_MODEL "" CACHE FILEPATH "Local Qwen GGUF for the optional integration test")
+    if(RAG_TEST_EMBEDDING_MODEL AND RAG_LLAMA_ARCHIVE)
+        add_test(NAME sqlite_real_chunks COMMAND rag_sqlite_tests real_chunks
+                 "${CMAKE_CURRENT_SOURCE_DIR}/data/demo" "${CMAKE_CURRENT_BINARY_DIR}" "${RAG_TEST_EMBEDDING_MODEL}")
+    endif()
 
     add_test(NAME cli_single_txt
              COMMAND rag_cli "${CMAKE_CURRENT_SOURCE_DIR}/data/demo/contract.txt"
