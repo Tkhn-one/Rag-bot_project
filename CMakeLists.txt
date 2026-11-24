@@ -4,7 +4,7 @@ project(RagBot LANGUAGES C CXX)
 option(BUILD_GUI "Build the Qt interface" OFF)
 option(WITH_LOCAL_LLM "Build the local generation provider" OFF)
 if(BUILD_GUI OR WITH_LOCAL_LLM)
-    message(FATAL_ERROR "This prototype supports the CLI with MockProvider only.")
+    message(FATAL_ERROR "This build supports CLI with MockProvider and OpenAI; Qt and local generation are pending.")
 endif()
 
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -89,6 +89,28 @@ add_library(rag_pugixml STATIC "${pugixml_sources_SOURCE_DIR}/src/pugixml.cpp")
 target_include_directories(rag_pugixml SYSTEM PUBLIC "${pugixml_sources_SOURCE_DIR}/src")
 target_compile_definitions(rag_pugixml PUBLIC PUGIXML_NO_XPATH)
 
+set(RAG_NLOHMANN_HEADER "" CACHE FILEPATH "Offline copy of the official nlohmann/json 3.12.0 single header")
+if(RAG_NLOHMANN_HEADER)
+    file(SHA256 "${RAG_NLOHMANN_HEADER}" nlohmann_header_hash)
+    if(NOT nlohmann_header_hash STREQUAL "aaf127c04cb31c406e5b04a63f1ae89369fccde6d8fa7cdda1ed4f32dfc5de63")
+        message(FATAL_ERROR "RAG_NLOHMANN_HEADER must match the official 3.12.0 json.hpp.")
+    endif()
+    set(nlohmann_include "${CMAKE_CURRENT_BINARY_DIR}/nlohmann-offline")
+    configure_file("${RAG_NLOHMANN_HEADER}" "${nlohmann_include}/nlohmann/json.hpp" COPYONLY)
+else()
+    FetchContent_Declare(nlohmann_sources
+        URL "https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz"
+        URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
+        TLS_VERIFY ON
+        TIMEOUT 60
+        SOURCE_SUBDIR unused
+    )
+    FetchContent_MakeAvailable(nlohmann_sources)
+    set(nlohmann_include "${nlohmann_sources_SOURCE_DIR}/include")
+endif()
+add_library(rag_json INTERFACE)
+target_include_directories(rag_json SYSTEM INTERFACE "${nlohmann_include}")
+
 add_library(rag_domain INTERFACE)
 target_include_directories(rag_domain INTERFACE include)
 target_compile_features(rag_domain INTERFACE cxx_std_20)
@@ -105,12 +127,14 @@ add_library(rag_infrastructure
     src/infrastructure/docx_reader.cpp
     src/infrastructure/local_file.cpp
     src/infrastructure/keyword_retriever.cpp
+    src/infrastructure/remote_api_provider.cpp
     src/infrastructure/sqlite_knowledge_store.cpp
     src/infrastructure/sqlite_search.cpp
     src/infrastructure/utf8.cpp
+    src/infrastructure/windows_openai.cpp
 )
 target_link_libraries(rag_infrastructure PUBLIC rag_application
-    PRIVATE rag_sqlite rag_pdfium rag_miniz rag_pugixml bcrypt)
+    PRIVATE rag_sqlite rag_pdfium rag_miniz rag_pugixml rag_json bcrypt winhttp advapi32)
 
 set(RAG_LLAMA_ARCHIVE "" CACHE FILEPATH "Local llama.cpp b6500 source archive for CPU embeddings")
 if(RAG_LLAMA_ARCHIVE)
@@ -151,12 +175,28 @@ if(BUILD_TESTING)
     add_executable(rag_sqlite_tests tests/sqlite_tests.cpp)
     target_link_libraries(rag_sqlite_tests PRIVATE rag_infrastructure rag_sqlite)
     foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure
-                          migration_v2 migration_v3 migration_v4 migration_v5 migration_v6 migration_v7 policy_revisions
+                          migration_v2 migration_v3 migration_v4 migration_v5 migration_v6 migration_v7 migration_v8 policy_revisions
                           cache_history cache_access_errors hybrid_search rrf long_blocks split_positions whole_terms)
         add_test(NAME sqlite_${case}
                  COMMAND rag_sqlite_tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
                          "${CMAKE_CURRENT_BINARY_DIR}")
     endforeach()
+
+    add_executable(rag_openai_tests tests/openai_tests.cpp)
+    target_link_libraries(rag_openai_tests PRIVATE rag_infrastructure rag_json)
+    foreach(case IN ITEMS request errors budget)
+        add_test(NAME openai_${case} COMMAND rag_openai_tests ${case})
+    endforeach()
+    foreach(case IN ITEMS restart policy_race)
+        add_test(NAME openai_${case}
+                 COMMAND "${CMAKE_COMMAND}" "-DTESTER=$<TARGET_FILE:rag_openai_tests>"
+                         "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}" "-DCASE=${case}"
+                         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/openai_database.cmake")
+    endforeach()
+    add_test(NAME cli_openai_policy
+             COMMAND "${CMAKE_COMMAND}" "-DCLI=$<TARGET_FILE:rag_cli>"
+                     "-DDEMO_DIR=${CMAKE_CURRENT_SOURCE_DIR}/data/demo" "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                     -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_openai_policy.cmake")
 
     set(RAG_TEST_EMBEDDING_MODEL "" CACHE FILEPATH "Local Qwen GGUF for the optional integration test")
     if(RAG_TEST_EMBEDDING_MODEL AND RAG_LLAMA_ARCHIVE)

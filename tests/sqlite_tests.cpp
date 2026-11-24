@@ -18,6 +18,10 @@ namespace {
 using namespace rag;
 namespace fs = std::filesystem;
 
+const Citation* firstCitation(const Answer& answer) {
+    return answer.claims().empty() ? nullptr : &answer.claims().front().citation;
+}
+
 class TemporaryDirectory {
 public:
     explicit TemporaryDirectory(const fs::path& parent) {
@@ -117,7 +121,7 @@ void requireCitation(const IKnowledgeStore& store, std::string question, Documen
     MockProvider provider;
     RagService service(store, retriever, provider);
     const auto answer = requireValue(service.ask(std::move(question)), "answering from SQLite");
-    const auto& citation = answer.citation();
+    const auto& citation = firstCitation(answer);
     require(citation && citation->source() == source && citation->documentId() == id &&
                 citation->line() == 4 && !citation->page() && citation->quote() == quote,
             "the stored citation's source, ID, line or text changed");
@@ -346,7 +350,7 @@ void migrate(const fs::path& directory) {
     createLegacyLibrary(path);
     const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 8, "opened database must advance to v8");
+    require(fixtureScalar(path, "PRAGMA user_version") == 9, "opened database must advance to v9");
     require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
                 fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
             "backup must retain the v1 schema, document ID and line");
@@ -404,7 +408,7 @@ void migratePdfEra(const fs::path& directory) {
             (42, 1, 'Orion snapshot runs every Friday.', 2);
     )sql");
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 8, "v2 must advance to v8");
+    require(fixtureScalar(path, "PRAGMA user_version") == 9, "v2 must advance to v9");
     const auto backup = directory / "pdf-era.sqlite.v2-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 2 &&
                 fixtureScalar(backup, "SELECT page FROM chunks WHERE document_id = 42") == 2,
@@ -414,9 +418,9 @@ void migratePdfEra(const fs::path& directory) {
     MockProvider provider;
     RagService service(*store, retriever, provider);
     const auto pdf = requireValue(service.ask("Orion"), "reading migrated PDF");
-    require(pdf.citation() && pdf.citation()->documentId() == 42 &&
-                pdf.citation()->source() == "protocol.pdf" && pdf.citation()->page() == 2 &&
-                !pdf.citation()->docx() && pdf.citation()->quote() == "Orion snapshot runs every Friday.",
+    require(firstCitation(pdf) && firstCitation(pdf)->documentId() == 42 &&
+                firstCitation(pdf)->source() == "protocol.pdf" && firstCitation(pdf)->page() == 2 &&
+                !firstCitation(pdf)->docx() && firstCitation(pdf)->quote() == "Orion snapshot runs every Friday.",
             "migration must preserve PDF citation, page and ID");
 }
 
@@ -445,7 +449,7 @@ void migrateDocxEra(const fs::path& directory) {
     const auto backup = directory / "docx-era.sqlite.v3-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 3 &&
                 fixtureScalar(backup, "SELECT docx_row FROM chunks WHERE document_id = 17 AND line = 2") == 2 &&
-                fixtureScalar(path, "PRAGMA user_version") == 8, "migration must preserve a readable v3 backup");
+                fixtureScalar(path, "PRAGMA user_version") == 9, "migration must preserve a readable v3 backup");
     const auto snapshot = requireValue(store->snapshot(), "reading migrated v3 library");
     require(snapshot.revision.number == 0 && snapshot.policy == DocumentPolicy::LocalOnly &&
                 snapshot.documents.size() == 1, "migration starts a closed library at its baseline revision");
@@ -471,7 +475,7 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int ver
         IndexingService index(reader, *store);
         requireValue(index.import(demo / "decisions.txt"), "preparing a revisioned library");
         previous = requireValue(store->snapshot(), "reading the previous revision").revision;
-        if (version == 5) {
+        if (version == 5 || version == 8) {
             const KeywordRetriever keyword;
             MockProvider mock;
             ValidatingLlmProvider validated(mock);
@@ -479,8 +483,35 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int ver
             RagService oldService(*store, keyword, cached, store.get());
             require(!requireValue(oldService.ask(decisionsQuestion), "seeding v5 cache and history").fromCache(),
                     "old keyword profile must have its own completed answer");
+            if (version == 8) {
+                require(requireValue(oldService.ask(decisionsQuestion), "seeding a cached legacy history entry").fromCache(),
+                        "legacy cached history must be seeded");
+                requireValue(oldService.ask("absent"), "seeding insufficient legacy history");
+                const DocxPosition location{"word/document.xml", TableCell{1, 2, 3}};
+                const Answer withCoordinates({{"Orion", Citation("old.docx", Chunk(42, 3, "Orion",
+                    {}, location, 5, CharacterRange{40, 44}))}});
+                requireValue(store->appendHistory("Legacy coordinates", previous, mock.profile(), withCoordinates),
+                             "seeding legacy DOCX coordinates");
+            }
         }
     }
+    // Reconstruct the previous answer tables before applying the older search-schema fixtures.
+    executeFixtureSql(path, R"sql(
+        CREATE TABLE old_answer_cache AS
+            SELECT a.key, c.document_id, c.chunk_id AS line
+            FROM answer_cache a JOIN cached_claims c ON c.cache_id = a.id;
+        CREATE TABLE old_history AS
+            SELECT h.*, c.document_id, c.source, c.line, c.quote, c.page, c.docx_part, c.docx_paragraph,
+                   c.docx_table, c.docx_row, c.docx_cell, c.first_char, c.last_char
+            FROM history h LEFT JOIN history_claims c ON c.history_id = h.id;
+        DROP TABLE cached_claims;
+        DROP TABLE history_claims;
+        DROP TABLE answer_cache;
+        DROP TABLE history;
+        ALTER TABLE old_answer_cache RENAME TO answer_cache;
+        ALTER TABLE old_history RENAME TO history;
+        PRAGMA user_version = 8;
+    )sql");
     if (version <= 6) executeFixtureSql(path, "DROP TABLE source_blocks; ALTER TABLE chunks DROP COLUMN last_char;"
                             "ALTER TABLE chunks DROP COLUMN first_char; ALTER TABLE chunks DROP COLUMN source_line;"
                             "ALTER TABLE history DROP COLUMN last_char; ALTER TABLE history DROP COLUMN first_char;");
@@ -488,7 +519,7 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int ver
         executeFixtureSql(path, "DROP TABLE chunks_fts; DROP TABLE embeddings; DROP TABLE search_profile");
         executeFixtureSql(path, version == 4 ? "DROP TABLE answer_cache; DROP TABLE history; PRAGMA user_version = 4"
                                              : "PRAGMA user_version = 5");
-    } else {
+    } else if (version < 8) {
         executeFixtureSql(path, "CREATE TRIGGER index_chunk AFTER INSERT ON chunks BEGIN "
                                 "INSERT INTO chunks_fts(text,document_id,line) VALUES(NEW.text,NEW.document_id,NEW.line); END;");
         executeFixtureSql(path, version == 6 ? "UPDATE search_profile SET settings='unicode61-bm25-cos-rrf-v1/20/60/8/2'; PRAGMA user_version=6"
@@ -496,16 +527,34 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int ver
     }
     const auto migrated = openStore(path);
     const auto backup = directory / ("revision-era.sqlite.v" + std::to_string(version) + "-backup") / "library.sqlite";
-    ++previous.number;  // Migration publishes a new index format.
+    if (version < 8) ++previous.number;  // Pre-v8 search formats publish a new index revision.
     require(fixtureScalar(backup, "PRAGMA user_version") == version &&
                 fixtureScalar(backup, "SELECT count(*) FROM documents") == 1 &&
-                fixtureScalar(path, "PRAGMA user_version") == 8 &&
+                fixtureScalar(path, "PRAGMA user_version") == 9 &&
                 fixtureScalar(path, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'копирование'") == 1 &&
                 requireValue(migrated->snapshot(), "reading the migrated revision").revision == previous,
             "migration must back up the database, populate FTS and publish a new revision");
     const auto history = requireValue(migrated->history(), "checking migrated history");
-    if (version == 5) {
-        require(history.size() == 1 && history.front().outdated, "v5 history must survive as a previous revision");
+    if (version == 5 || version == 8) {
+        require(history.size() == (version == 5 ? 1 : 4) && history.front().outdated == (version == 5),
+                "the legacy history must survive with the correct revision");
+        const auto* citation = firstCitation(history.front().answer);
+        require(citation && citation->quote() == decisionsQuote && citation->source() == "decisions.txt" &&
+                    citation->line() == 4 && citation->documentId() == 1 &&
+                    history.front().answer.claims().front().text == decisionsQuote,
+                "the legacy extractive response and quote must survive");
+        require(fixtureScalar(backup, "SELECT count(*) FROM answer_cache") == 1 &&
+                    fixtureScalar(path, "SELECT count(*) FROM answer_cache") == 0,
+                "migration must invalidate the legacy cache while keeping it in the backup");
+        if (version == 8) {
+            require(history[1].answer.fromCache() && history[2].answer.status() == AnswerStatus::InsufficientEvidence,
+                    "cached and insufficient legacy outcomes must survive");
+            const auto* docx = firstCitation(history[3].answer);
+            require(docx && docx->source() == "old.docx" && docx->quote() == "Orion" &&
+                        docx->docx() == DocxPosition{"word/document.xml", TableCell{1, 2, 3}} &&
+                        docx->characters() == CharacterRange{40, 44},
+                    "the legacy DOCX anchor and exact character range must survive");
+        }
         MockProvider mock;
         ValidatingLlmProvider validated(mock);
         CachingLlmProvider cached(validated, *migrated);
@@ -522,23 +571,19 @@ class CountingProvider final : public ILlmProvider {
 public:
     ModelProfile configured{ProcessingType::Local, "probe"};
     int calls = 0;
-    bool invalidPosition = false;
+    bool invalidChunk = false;
     bool fail = false;
     std::string lastQuestion;
 
     ModelProfile profile() const override { return configured; }
-    Result<ProposedCitation> generate(const GenerationRequest& request) override {
+    Result<GenerationResult> generate(const GenerationRequest& request) override {
         ++calls;
         lastQuestion = request.question.text();
         if (fail) {
             return AppError::StoreUnavailable;
         }
-        auto citation = ProposedCitation::fromChunk(request.evidence.front());
-        if (invalidPosition) {
-            citation.docx.reset();
-            citation.page = 999;
-        }
-        return citation;
+        const auto& quote = request.evidence.front().text();
+        return GenerationResult{Answered{{{quote, invalidChunk ? "c999" : "c1", quote}}}};
     }
 };
 
@@ -557,7 +602,7 @@ void cacheAndHistory(const fs::path& directory) {
         CachingLlmProvider cached(validated, *store);
         RagService service(*store, retriever, cached, store.get());
         const auto first = requireValue(service.ask(original), "asking the first question");
-        require(!first.fromCache() && first.citation() && probe.calls == 1 &&
+        require(!first.fromCache() && firstCitation(first) && probe.calls == 1 &&
                     probe.lastQuestion == "Orion\nsnapshot", "miss must generate once with canonical newlines");
         require(requireValue(service.ask("Orion\rsnapshot"), "asking equivalent question").fromCache() &&
                     probe.calls == 1, "repeated question must skip generation");
@@ -576,7 +621,7 @@ void cacheAndHistory(const fs::path& directory) {
     require(history.size() == 3 && history[0].question == original && !history[0].answer.fromCache() &&
                 history[1].answer.fromCache() && history[2].answer.fromCache(), "both cache hits must be in history");
     for (const auto& entry : history) {
-        const auto& c = entry.answer.citation();
+        const auto& c = firstCitation(entry.answer);
         require(!entry.timeUtc.empty() && entry.timeUtc.back() == 'Z' && !entry.outdated &&
                     entry.revision == IndexRevision{std::string(32, '1'), 1} && entry.profile == probe.configured &&
                     c && c->documentId() == 1 && c->line() == 3 && c->source() == "source.docx" &&
@@ -604,7 +649,7 @@ void cacheAndHistory(const fs::path& directory) {
                     probe.calls == before + 1, "changing any identity field must cause a miss");
     }
     const auto noMatch = requireValue(service.ask("absent"), "asking without evidence");
-    require(!noMatch.citation() && !requireValue(store->history(), "reading no-match history").back().answer.citation(),
+    require(!firstCitation(noMatch) && !firstCitation(requireValue(store->history(), "reading no-match history").back().answer),
             "insufficient evidence must be a completed history result");
     requireValue(store->clearHistory(), "clearing history");
     require(requireValue(store->history(), "reading cleared history").empty() &&
@@ -617,13 +662,13 @@ public:
     explicit CountingCache(IAnswerCacheStore& store) : store_(store) {}
     mutable int reads = 0;
     int writes = 0;
-    Result<std::optional<ChunkReference>> lookup(const GenerationRequest& request) const override {
+    Result<std::optional<GenerationResult>> lookup(const GenerationRequest& request) const override {
         ++reads;
         return store_.lookup(request);
     }
-    Result<bool> remember(const GenerationRequest& request, ChunkReference citation) override {
+    Result<bool> remember(const GenerationRequest& request, const GenerationResult& result) override {
         ++writes;
-        return store_.remember(request, citation);
+        return store_.remember(request, result);
     }
 private:
     IAnswerCacheStore& store_;
@@ -645,11 +690,11 @@ void cacheAccessAndFailures(const fs::path& directory) {
     require(cache.reads == 0 && cache.writes == 0 && probe.calls == 0, "denial must precede even reading the cache");
 
     probe.configured.processing = ProcessingType::Local;
-    probe.invalidPosition = true;
+    probe.invalidChunk = true;
     for (int i = 0; i < 2; ++i) {
-        requireError(service.ask("Orion"), AppError::InvalidCitation, "invalid page must fail on every attempt");
+        requireError(service.ask("Orion"), AppError::InvalidCitation, "an unknown chunk must fail on every attempt");
     }
-    probe.invalidPosition = false;
+    probe.invalidChunk = false;
     probe.fail = true;
     requireError(service.ask("Orion"), AppError::StoreUnavailable, "provider failure must propagate");
     require(cache.reads == 3 && probe.calls == 3 && cache.writes == 0 &&
@@ -729,16 +774,16 @@ void longBlocks(const fs::path& directory, const IEmbeddingProvider& model) {
         return requireValue(RagService(*store, *store, cached, store.get()).ask("TailMarker"), "asking for the tail");
     };
     const auto first = askTail();
-    require(first.citation() && first.citation()->line() == 3 && first.citation()->quote().ends_with("TailMarker") &&
-            first.citation()->characters() == pieces[pieces.size() - 2].characters(), "wrong tail citation");
+    require(firstCitation(first) && firstCitation(first)->line() == 3 && firstCitation(first)->quote().ends_with("TailMarker") &&
+            firstCitation(first)->characters() == pieces[pieces.size() - 2].characters(), "wrong tail citation");
     store.reset();
     store = openStore(path);
     requireValue(store->configureSearch(&model), "reopening the same profile");
     const auto second = askTail();
     const auto history = requireValue(store->history(), "reading history after restart");
-    require(second.fromCache() && second.citation() && second.citation()->characters() == first.citation()->characters() &&
-            history.at(0).answer.citation() && history.at(0).answer.citation()->characters() == first.citation()->characters() &&
-            history.at(0).answer.citation()->quote() == first.citation()->quote(), "tail citation changed after reopening");
+    require(second.fromCache() && firstCitation(second) && firstCitation(second)->characters() == firstCitation(first)->characters() &&
+            firstCitation(history.at(0).answer) && firstCitation(history.at(0).answer)->characters() == firstCitation(first)->characters() &&
+            firstCitation(history.at(0).answer)->quote() == firstCitation(first)->quote(), "tail citation changed after reopening");
     requireValue(store->configureSearch(nullptr, {}, true), "reindexing with FTS alone");
     require(fixtureScalar(path, "SELECT count(*) FROM source_blocks") == 3 &&
             fixtureScalar(path, "SELECT max(last_char) = (SELECT length(text) FROM source_blocks WHERE line=3) "
@@ -786,19 +831,19 @@ void wholeTerms(const fs::path& directory) {
     RagService rag(*store, *store, mock);
     const auto checkAmount = [&] {
         const auto a = requireValue(rag.ask("150000"), "searching for the exact amount");
-        require(a.citation() && a.citation()->line() == 1 && a.citation()->characters() &&
-                a.citation()->quote().find("150000") != std::string::npos, "exact amount must remain citable");
-        const auto range = *a.citation()->characters();
-        require(decodeUtf8(a.citation()->quote()).value() ==
+        require(firstCitation(a) && firstCitation(a)->line() == 1 && firstCitation(a)->characters() &&
+                firstCitation(a)->quote().find("150000") != std::string::npos, "exact amount must remain citable");
+        const auto range = *firstCitation(a)->characters();
+        require(decodeUtf8(firstCitation(a)->quote()).value() ==
                     decodeUtf8(amount).value().substr(range.first - 1, range.last - range.first + 1),
                 "amount citation must point to the original characters");
     };
     checkAmount();
     for (const char* absent : {"15000", "опл", "77777"}) {
-        require(!requireValue(rag.ask(absent), "searching for a cut term").citation(), "FTS found an invented term");
+        require(!firstCitation(requireValue(rag.ask(absent), "searching for a cut term")), "FTS found an invented term");
     }
     for (const char* present : {"915000", "оплата", "маркер"}) {
-        require(requireValue(rag.ask(present), "searching for an intact term").citation().has_value(), "FTS lost a term");
+        require(firstCitation(requireValue(rag.ask(present), "searching for an intact term")) != nullptr, "FTS lost a term");
     }
     FixtureEmbeddings embeddings;
     requireValue(store->configureSearch(&embeddings, {}, true), "reindexing the boundary fixture with embeddings");
@@ -954,6 +999,8 @@ int wmain(int argc, wchar_t* argv[]) {
             migrateRevisionEra(directory.path(), argv[2], 6);
         } else if (test == L"migration_v7") {
             migrateRevisionEra(directory.path(), argv[2], 7);
+        } else if (test == L"migration_v8") {
+            migrateRevisionEra(directory.path(), argv[2], 8);
         } else if (test == L"long_blocks") {
             longBlocks(directory.path(), FixtureEmbeddings{});
         } else if (test == L"split_positions") {

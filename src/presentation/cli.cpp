@@ -20,9 +20,37 @@ std::string_view describeError(AppError error) {
     case AppError::EmptyQuestion:
         return "Введите вопрос.";
     case AppError::InvalidCitation:
-        return "Тестовый провайдер вернул неподтверждённую цитату.";
+        return "Провайдер вернул неподтверждённую цитату.";
+    case AppError::InvalidGeneration:
+        return "Провайдер вернул ответ в неожиданном формате.";
+    case AppError::RemoteContextTooLarge:
+        return "Запрос превышает допустимый размер для OpenAI. Сократите вопрос.";
+    case AppError::ApiKeyMissing:
+        return "Ключ OpenAI отсутствует в выбранном источнике.";
+    case AppError::ApiKeyUnavailable:
+        return "Не удалось прочитать ключ OpenAI или ключ имеет неверный формат.";
+    case AppError::RemoteUnauthorized:
+        return "OpenAI отклонил ключ (HTTP 401).";
+    case AppError::RemoteForbidden:
+        return "OpenAI запретил доступ (HTTP 403). Проверьте доступ проекта к API и модели.";
+    case AppError::RemoteRateLimited:
+        return "OpenAI ограничил запросы или исчерпана квота (HTTP 429).";
+    case AppError::RemoteServiceUnavailable:
+        return "OpenAI временно недоступен (HTTP 5xx).";
+    case AppError::RemoteHttpError:
+        return "OpenAI отклонил запрос. Проверьте выбранную модель.";
+    case AppError::RemoteNetworkError:
+        return "Не удалось установить защищённое соединение с OpenAI или прочитать ответ.";
+    case AppError::RemoteTimeout:
+        return "Истекло время ожидания ответа OpenAI.";
+    case AppError::RemoteRefusal:
+        return "Модель OpenAI отказалась отвечать на этот вопрос.";
+    case AppError::RemoteIncomplete:
+        return "OpenAI вернул незавершённый ответ.";
     case AppError::RemoteProcessingDenied:
         return "Внешняя обработка запрещена. Для неё требуется разрешение библиотеки и каждого документа.";
+    case AppError::LibraryBusy:
+        return "Библиотека занята. Повторите команду после завершения текущей операции.";
     case AppError::EmbeddingFailed:
         return "Не удалось загрузить модель или вычислить локальный вектор. Проверьте сборку, GGUF и длину фрагмента.";
     case AppError::SearchProfileMismatch:
@@ -59,20 +87,10 @@ std::string_view describeError(AppError error) {
 
 namespace {
 
-void printAnswer(const Answer& answer, std::ostream& output) {
-    if (answer.fromCache()) {
-        output << "Ответ из кэша.\n";
-    }
-    const auto& citation = answer.citation();
-    if (!citation) {
-        output << "В библиотеке не найдено подтверждения по словам вопроса.\n";
-        return;
-    }
-
-    output << "Найденный фрагмент (тестовый провайдер)\n"
-           << "«" << citation->quote() << "»\n"
-           << "Источник: " << citation->source();
-    if (const auto& docx = citation->docx()) {
+void printCitation(const Citation& citation, std::ostream& output) {
+    output << "«" << citation.quote() << "»\n"
+           << "Источник: " << citation.source();
+    if (const auto& docx = citation.docx()) {
         output << ", часть " << docx->part;
         if (const auto* paragraph = std::get_if<std::size_t>(&docx->anchor)) {
             output << ", абзац " << *paragraph;
@@ -80,16 +98,35 @@ void printAnswer(const Answer& answer, std::ostream& output) {
             const auto& cell = std::get<TableCell>(docx->anchor);
             output << ", таблица " << cell.table << ", строка " << cell.row << ", ячейка " << cell.cell;
         }
-    } else if (const auto page = citation->page()) {
+    } else if (const auto page = citation.page()) {
         output << ", страница " << *page;
     } else {
-        output << ", строка " << citation->line();
+        output << ", строка " << citation.line();
     }
-    if (const auto range = citation->characters()) {
-        if (citation->page()) output << ", строка " << citation->line();
+    if (const auto range = citation.characters()) {
+        if (citation.page()) output << ", строка " << citation.line();
         output << ", символы " << range->first << "–" << range->last;
     }
-    output << " (ID документа " << citation->documentId() << ")\n";
+    output << " (ID документа " << citation.documentId() << ")\n";
+}
+
+void printAnswer(const Answer& answer, ProcessingType processing, std::ostream& output) {
+    if (answer.fromCache()) output << "Ответ из кэша.\n";
+    if (answer.status() == AnswerStatus::InsufficientEvidence) {
+        output << (processing == ProcessingType::Local
+                   ? "В библиотеке не найдено подтверждения по словам вопроса.\n"
+                   : "В библиотеке недостаточно подтверждений для ответа.\n");
+        return;
+    }
+    if (processing == ProcessingType::Local) output << "Найденный фрагмент (тестовый провайдер)\n";
+    for (const auto& claim : answer.claims()) {
+        if (processing == ProcessingType::Remote) output << claim.text << '\n';
+        printCitation(claim.citation, output);
+    }
+}
+
+std::string_view policyName(DocumentPolicy policy) {
+    return policy == DocumentPolicy::AllowRemote ? "AllowRemote" : "LocalOnly";
 }
 
 }  // namespace
@@ -119,13 +156,43 @@ int runHistoryCli(IHistoryStore& store, bool clear, std::ostream& output, std::o
         output << '\n' << entry.timeUtc << " | " << entry.profile.modelId << " | ревизия "
                << entry.revision.number << (entry.outdated ? " (устарела)" : "") << '\n'
                << entry.question << '\n';
-        printAnswer(entry.answer, output);
+        printAnswer(entry.answer, entry.profile.processing, output);
+    }
+    return 0;
+}
+
+int runPolicyCli(IKnowledgeStore& store, std::optional<DocumentId> document, std::optional<DocumentPolicy> policy,
+                 std::ostream& output, std::ostream& errors) {
+    if (policy) {
+        const auto result = document ? store.setDocumentPolicy(*document, *policy) : store.setLibraryPolicy(*policy);
+        if (const auto* error = std::get_if<AppError>(&result)) {
+            errors << describeError(*error) << '\n';
+            return 1;
+        }
+        if (document) {
+            output << "Документ " << *document << ": ";
+        } else {
+            output << "Библиотека: ";
+        }
+        output << policyName(*policy) << '\n';
+        return 0;
+    }
+
+    const auto result = store.snapshot();
+    if (const auto* error = std::get_if<AppError>(&result)) {
+        errors << describeError(*error) << '\n';
+        return 1;
+    }
+    const auto& library = std::get<LibrarySnapshot>(result);
+    output << "Библиотека: " << policyName(library.policy) << '\n';
+    for (const auto& doc : library.documents) {
+        output << doc.id() << " | " << doc.source() << " | " << policyName(doc.policy()) << '\n';
     }
     return 0;
 }
 
 int runCli(IndexingService& index, RagService& rag, std::span<const std::filesystem::path> files,
-           std::string question, std::ostream& output, std::ostream& errors) {
+           std::string question, ProcessingType processing, std::ostream& output, std::ostream& errors) {
     std::size_t failedImports = 0;
     for (const auto& file : files) {
         const auto imported = index.import(file);
@@ -163,7 +230,7 @@ int runCli(IndexingService& index, RagService& rag, std::span<const std::filesys
         return 1;
     }
 
-    printAnswer(std::get<Answer>(result), output);
+    printAnswer(std::get<Answer>(result), processing, output);
     return status;
 }
 

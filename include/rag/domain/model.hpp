@@ -6,6 +6,7 @@
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace rag {
 
@@ -32,7 +33,21 @@ enum class AppError {
     DocxLimitExceeded,
     RemoteProcessingDenied,
     EmbeddingFailed,
-    SearchProfileMismatch
+    SearchProfileMismatch,
+    InvalidGeneration,
+    RemoteContextTooLarge,
+    ApiKeyMissing,
+    ApiKeyUnavailable,
+    RemoteUnauthorized,
+    RemoteForbidden,
+    RemoteRateLimited,
+    RemoteServiceUnavailable,
+    RemoteHttpError,
+    RemoteNetworkError,
+    RemoteTimeout,
+    RemoteRefusal,
+    RemoteIncomplete,
+    LibraryBusy
 };
 
 template <typename T>
@@ -157,19 +172,27 @@ private:
     Chunk chunk_;
 };
 
-// The prototype's answer is extractive: absence of a citation means
-// that the document contained no matching evidence.
+struct CitedClaim {
+    std::string text;
+    Citation citation;
+};
+
+enum class AnswerStatus { Answered, InsufficientEvidence };
+
 class Answer {
 public:
     Answer() = default;
-    explicit Answer(Citation citation, bool fromCache = false)
-        : citation_(std::move(citation)), fromCache_(fromCache) {}
+    explicit Answer(std::vector<CitedClaim> claims, bool fromCache = false)
+        : claims_(std::move(claims)), fromCache_(fromCache) {}
 
-    const std::optional<Citation>& citation() const noexcept { return citation_; }
+    AnswerStatus status() const noexcept {
+        return claims_.empty() ? AnswerStatus::InsufficientEvidence : AnswerStatus::Answered;
+    }
+    const std::vector<CitedClaim>& claims() const noexcept { return claims_; }
     bool fromCache() const noexcept { return fromCache_; }
 
 private:
-    std::optional<Citation> citation_;
+    std::vector<CitedClaim> claims_;
     bool fromCache_ = false;
 };
 

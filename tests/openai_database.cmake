@@ -1,0 +1,15 @@
+string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef id)
+set(db "${BUILD_DIR}/openai-${CASE}-${id}.sqlite")
+
+set(modes "${CASE}")
+if(CASE STREQUAL "restart")
+    set(modes seed hit)
+endif()
+foreach(mode IN LISTS modes)
+    execute_process(COMMAND "${TESTER}" "${mode}" "${db}"
+                    RESULT_VARIABLE status ERROR_VARIABLE error)
+    if(NOT status STREQUAL "0")
+        message(FATAL_ERROR "OpenAI database test (${mode}): ${status}\n${error}")
+    endif()
+endforeach()
+file(REMOVE "${db}")

@@ -26,7 +26,7 @@ class ValidatingLlmProvider final : public ILlmProvider {
 public:
     explicit ValidatingLlmProvider(ILlmProvider& inner) : inner_(inner) {}
     ModelProfile profile() const override { return inner_.profile(); }
-    Result<ProposedCitation> generate(const GenerationRequest& request) override;
+    Result<GenerationResult> generate(const GenerationRequest& request) override;
 
 private:
     ILlmProvider& inner_;
@@ -37,7 +37,7 @@ public:
     CachingLlmProvider(ValidatingLlmProvider& validated, IAnswerCacheStore& cache)
         : validated_(validated), cache_(cache) {}
     ModelProfile profile() const override { return validated_.profile(); }
-    Result<ProposedCitation> generate(const GenerationRequest& request) override;
+    Result<GenerationResult> generate(const GenerationRequest& request) override;
 
 private:
     ValidatingLlmProvider& validated_;
@@ -53,6 +53,8 @@ public:
     Result<Answer> ask(std::string question);
 
 private:
+    Result<Answer> askWithProfile(const std::string& text, const Question& query, const ModelProfile& profile);
+
     const IKnowledgeStore& store_;
     const IRetriever& retriever_;
     ILlmProvider& provider_;

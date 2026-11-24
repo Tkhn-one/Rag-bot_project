@@ -75,6 +75,11 @@ public:
         return LibrarySnapshot{revision_, policy_, documents_};
     }
 
+    Result<Answer> runRemoteQuestion(const RemoteQuestion& question) const override {
+        // This store belongs to a single worker and has no shared database connections.
+        return question();
+    }
+
     Result<bool> setLibraryPolicy(DocumentPolicy policy) override {
         if (policy_ == policy) {
             return false;
@@ -112,11 +117,12 @@ class MockProvider final : public ILlmProvider {
 public:
     ModelProfile profile() const override { return {ProcessingType::Local, "mock-extractive-v1"}; }
 
-    Result<ProposedCitation> generate(const GenerationRequest& request) override {
+    Result<GenerationResult> generate(const GenerationRequest& request) override {
         if (request.evidence.empty()) {
-            return AppError::InvalidCitation;
+            return GenerationResult{};
         }
-        return ProposedCitation::fromChunk(request.evidence.front());
+        const auto& text = request.evidence.front().text();
+        return GenerationResult{Answered{{{text, contextChunkId(0), text}}}};
     }
 };
 

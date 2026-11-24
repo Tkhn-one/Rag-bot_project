@@ -183,7 +183,8 @@ Result<bool> SqliteKnowledgeStore::configureSearch(const IEmbeddingProvider* pro
         if (!update || !sql::bindText(update.get(), 1, provider ? provider->profileId() : "") ||
             sqlite3_bind_int64(update.get(), 2, provider ? provider->dimension() : 0) != SQLITE_OK ||
             !sql::bindText(update.get(), 3, settingsId(settings)) || sqlite3_step(update.get()) != SQLITE_DONE ||
-            !sql::execute(db, "UPDATE library SET revision=revision+1 WHERE id=1")) return AppError::StoreWriteFailed;
+            !sql::execute(db, "UPDATE library SET revision=revision+1 WHERE id=1") ||
+            !sql::execute(db, "DELETE FROM answer_cache")) return AppError::StoreWriteFailed;
     }
     if (!txn.commit()) return AppError::StoreWriteFailed;
     embeddings_ = provider;

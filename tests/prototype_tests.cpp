@@ -12,22 +12,22 @@ using namespace rag;
 
 class ProbeProvider final : public ILlmProvider {
 public:
-    explicit ProbeProvider(ProposedCitation proposal, ProcessingType processing = ProcessingType::Local)
+    explicit ProbeProvider(ProposedClaim proposal, ProcessingType processing = ProcessingType::Local)
         : proposal_(std::move(proposal)), processing_(processing) {}
 
     ModelProfile profile() const override {
         return {processing_, processing_ == ProcessingType::Local ? "test-local" : "test-remote"};
     }
 
-    Result<ProposedCitation> generate(const GenerationRequest&) override {
+    Result<GenerationResult> generate(const GenerationRequest&) override {
         ++calls_;
-        return proposal_;
+        return GenerationResult{Answered{{proposal_}}};
     }
 
     int calls() const noexcept { return calls_; }
 
 private:
-    ProposedCitation proposal_;
+    ProposedClaim proposal_;
     ProcessingType processing_;
     int calls_ = 0;
 };
@@ -40,6 +40,7 @@ public:
     }
 
     Result<LibrarySnapshot> snapshot() const override { return AppError::StoreReadFailed; }
+    Result<Answer> runRemoteQuestion(const RemoteQuestion& question) const override { return question(); }
     Result<bool> setLibraryPolicy(DocumentPolicy) override { return AppError::StoreWriteFailed; }
     Result<bool> setDocumentPolicy(DocumentId, DocumentPolicy) override { return AppError::StoreWriteFailed; }
 };
@@ -105,10 +106,10 @@ constexpr std::string_view decisionsQuote =
 bool cites(const Result<Answer>& result, DocumentId id, std::string_view source,
            std::string_view quote) {
     const auto* answer = std::get_if<Answer>(&result);
-    return answer && answer->citation() && answer->citation()->documentId() == id &&
-           answer->citation()->source() == source && answer->citation()->line() == demoLine &&
-           !answer->citation()->page() &&
-           answer->citation()->quote() == quote;
+    if (!answer || answer->claims().size() != 1) return false;
+    const auto& citation = answer->claims().front().citation;
+    return citation.documentId() == id && citation.source() == source && citation.line() == demoLine &&
+           !citation.page() && citation.quote() == quote;
 }
 
 std::vector<IndexedDocument> storedDocuments(const InMemoryKnowledgeStore& store) {
@@ -141,7 +142,7 @@ bool providerAccess(const std::filesystem::path& demo) {
     const auto contract = documents.front().id();
     const auto decisions = documents.back().id();
     CountingRetriever retriever;
-    ProbeProvider remote({demoLine, std::string(contractQuote), contract}, ProcessingType::Remote);
+    ProbeProvider remote({"Срок приёмки указан.", "c1", std::string(contractQuote)}, ProcessingType::Remote);
     RagService external(store, retriever, remote);
     if (!expect(store.setLibraryPolicy(DocumentPolicy::AllowRemote) == Result<bool>(true) &&
                     store.setDocumentPolicy(contract, DocumentPolicy::AllowRemote) == Result<bool>(true),
@@ -152,7 +153,7 @@ bool providerAccess(const std::filesystem::path& demo) {
         return false;
     }
 
-    ProbeProvider local({demoLine, std::string(decisionsQuote), decisions});
+    ProbeProvider local({"День копирования указан.", "c1", std::string(decisionsQuote)});
     RagService offline(store, retriever, local);
     if (!expect(cites(offline.ask("Резервное копирование"), decisions, "decisions.txt", decisionsQuote) &&
                     retriever.calls == 1 && local.calls() == 1 && remote.calls() == 0,
@@ -217,20 +218,18 @@ bool pagedCitation() {
     }
     const auto result = service.ask("Orion");
     const auto* answer = std::get_if<Answer>(&result);
-    if (!expect(answer && answer->citation() && answer->citation()->page() == 2,
+    if (!expect(answer && answer->claims().size() == 1 && answer->claims().front().citation.page() == 2,
                 "the citation must point to page 2")) {
         return false;
     }
-    const auto& citation = *answer->citation();
-    for (auto page : {std::optional<std::size_t>{1}, std::optional<std::size_t>{}}) {
-        ProbeProvider invalid({citation.line(), citation.quote(), citation.documentId(), page});
-        RagService invalidService(store, retriever, invalid);
-        if (!expect(isError(invalidService.ask("Orion"), AppError::InvalidCitation),
-                    "a missing or incorrect page must invalidate a PDF citation")) {
-            return false;
-        }
-    }
-    return true;
+    ProbeProvider excerpt({"There is a snapshot.", "c1", "snapshot"});
+    RagService excerptService(store, retriever, excerpt);
+    const auto excerptResult = excerptService.ask("Orion");
+    const auto* excerptAnswer = std::get_if<Answer>(&excerptResult);
+    return expect(excerptAnswer && excerptAnswer->claims().size() == 1 &&
+                      excerptAnswer->claims().front().citation.page() == 2 &&
+                      excerptAnswer->claims().front().citation.characters() == CharacterRange{7, 14},
+                  "subquote coordinates must come from the indexed page");
 }
 
 bool run(std::string_view test, const std::filesystem::path& demo,
@@ -247,7 +246,7 @@ bool run(std::string_view test, const std::filesystem::path& demo,
 
     const TxtReader reader;
     const KeywordRetriever retriever;
-    ProbeProvider probe({4, "Выдуманная цитата."});
+    ProbeProvider probe({"Утверждение", "c1", "Выдуманная цитата."});
     if (test == "store_errors") {
         FailingKnowledgeStore store;
         IndexingService index(reader, store);
@@ -273,7 +272,7 @@ bool run(std::string_view test, const std::filesystem::path& demo,
         const auto* answer = std::get_if<Answer>(&result);
         return expect(isError(imported, AppError::EmptyDocument), "expected EmptyDocument") &&
                expect(storedDocuments(store).empty(), "failed import must not publish a document") &&
-               expect(answer && !answer->citation() && probe.calls() == 0,
+               expect(answer && answer->status() == AnswerStatus::InsufficientEvidence && probe.calls() == 0,
                       "asking against an empty store must skip generation");
     }
     if (test == "missing_file") {
@@ -322,14 +321,14 @@ bool run(std::string_view test, const std::filesystem::path& demo,
         const auto secondId = secondDocument.id();
         if (test == "wrong_document_citation") {
             for (const auto& proposal : {
-                     ProposedCitation{demoLine, std::string(decisionsQuote), firstId},
-                     ProposedCitation{999, std::string(decisionsQuote), secondId},
-                     ProposedCitation{demoLine, "Выдуманная цитата.", secondId}}) {
+                     ProposedClaim{"Утверждение", "c2", std::string(decisionsQuote)},
+                     ProposedClaim{"Утверждение", "c1", std::string(contractQuote)},
+                     ProposedClaim{"Утверждение", "c1", "Выдуманная цитата."}}) {
                 ProbeProvider invalid(proposal);
                 RagService service(store, retriever, invalid);
                 if (!expect(isError(service.ask("Резервное копирование"), AppError::InvalidCitation) &&
                                 invalid.calls() == 1,
-                            "validation must check document ID, line and quote against evidence")) {
+                            "validation must bind each quotation to its own context ID")) {
                     return false;
                 }
             }
@@ -350,14 +349,7 @@ bool run(std::string_view test, const std::filesystem::path& demo,
     if (test == "answer") {
         MockProvider mock;
         RagService service(store, retriever, mock);
-        const auto result = service.ask("Какой СРОК приёмки?");
-        const auto* answer = std::get_if<Answer>(&result);
-        return expect(answer && answer->citation() &&
-                          answer->citation()->source() == "contract.txt" &&
-                          answer->citation()->line() == 4 &&
-                          !answer->citation()->page() &&
-                          answer->citation()->quote() ==
-                              "Срок приёмки результата составляет десять рабочих дней.",
+        return expect(cites(service.ask("Какой СРОК приёмки?"), 1, "contract.txt", contractQuote),
                       "expected the original quotation from line 4");
     }
     if (test == "empty_question") {
@@ -368,20 +360,18 @@ bool run(std::string_view test, const std::filesystem::path& demo,
     if (test == "no_match") {
         const auto result = withProbe.ask("Астрономия");
         const auto* answer = std::get_if<Answer>(&result);
-        return expect(answer && !answer->citation(), "expected insufficient evidence") &&
+        return expect(answer && answer->status() == AnswerStatus::InsufficientEvidence, "expected insufficient evidence") &&
                expect(probe.calls() == 0, "no evidence must skip generation");
     }
     if (test == "unknown_citation") {
-        const auto documentId = storedDocuments(store).front().id();
-        ProbeProvider unknown({999, std::string(contractQuote), documentId});
+        ProbeProvider unknown({"Утверждение", "c999", std::string(contractQuote)});
         RagService service(store, retriever, unknown);
         return expect(isError(service.ask("срок приёмки"), AppError::InvalidCitation) &&
                           unknown.calls() == 1,
-                      "a citation with an unknown line must be rejected");
+                      "a citation with an unknown context ID must be rejected");
     }
     if (test == "altered_quote") {
-        const auto documentId = storedDocuments(store).front().id();
-        ProbeProvider altered({demoLine, "Выдуманная цитата.", documentId});
+        ProbeProvider altered({"Утверждение", "c1", "Выдуманная цитата."});
         RagService service(store, retriever, altered);
         return expect(isError(service.ask("срок приёмки"), AppError::InvalidCitation) &&
                           altered.calls() == 1,

@@ -18,10 +18,11 @@ public:
                              std::vector<DocumentLine> lines, DocumentPolicy policy,
                              std::string positionLayout = {}) override;
     Result<LibrarySnapshot> snapshot() const override;
+    Result<Answer> runRemoteQuestion(const RemoteQuestion& question) const override;
     Result<bool> setLibraryPolicy(DocumentPolicy policy) override;
     Result<bool> setDocumentPolicy(DocumentId id, DocumentPolicy policy) override;
-    Result<std::optional<ChunkReference>> lookup(const GenerationRequest& request) const override;
-    Result<bool> remember(const GenerationRequest& request, ChunkReference citation) override;
+    Result<std::optional<GenerationResult>> lookup(const GenerationRequest& request) const override;
+    Result<bool> remember(const GenerationRequest& request, const GenerationResult& result) override;
     Result<bool> appendHistory(const std::string& question, const IndexRevision& revision,
                                const ModelProfile& profile, const Answer& answer) override;
     Result<std::vector<HistoryEntry>> history() const override;

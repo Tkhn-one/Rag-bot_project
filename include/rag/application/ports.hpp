@@ -2,7 +2,9 @@
 
 #include "rag/domain/model.hpp"
 
+#include <charconv>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -67,6 +69,8 @@ public:
 
 class IKnowledgeStore {
 public:
+    using RemoteQuestion = std::function<Result<Answer>()>;
+
     virtual ~IKnowledgeStore() = default;
 
     // Publish the document and its lines together. Line numbers must be positive and unique.
@@ -77,6 +81,9 @@ public:
 
     // Read metadata, policies and ordered documents at one revision.
     virtual Result<LibrarySnapshot> snapshot() const = 0;
+
+    // Run synchronously under the same exclusion used for policy writes, starting before the snapshot.
+    virtual Result<Answer> runRemoteQuestion(const RemoteQuestion& question) const = 0;
 
     // Return true for a committed change, false for an already active policy.
     virtual Result<bool> setLibraryPolicy(DocumentPolicy policy) = 0;
@@ -108,39 +115,54 @@ public:
     virtual Result<std::vector<Chunk>> retrieve(const Question& question, const LibrarySnapshot& library) const = 0;
 };
 
-struct ProposedCitation {
-    std::size_t line;
+struct ProposedClaim {
+    std::string text;
+    std::string chunkId;
     std::string quote;
-    DocumentId documentId = 0;
-    std::optional<std::size_t> page = {};
-    std::optional<DocxPosition> docx = {};
-    bool fromCache = false;
-    std::optional<CharacterRange> characters = {};
-    std::size_t chunkId = 0;
-
-    static ProposedCitation fromChunk(const Chunk& chunk, bool cached = false) {
-        return {chunk.line(), chunk.text(), chunk.documentId(), chunk.page(), chunk.docx(), cached,
-                chunk.characters(), chunk.chunkId()};
-    }
 };
+
+struct Answered {
+    std::vector<ProposedClaim> claims;
+};
+
+struct InsufficientEvidence {};
+
+struct GenerationResult {
+    std::variant<InsufficientEvidence, Answered> value;
+    bool fromCache = false;
+};
+
+// IDs belong to one ordered request. They reveal no source metadata.
+inline std::string contextChunkId(std::size_t index) {
+    return "c" + std::to_string(index + 1);
+}
+
+inline std::optional<std::size_t> contextChunkIndex(std::string_view id, std::size_t evidenceSize) {
+    if (id.size() < 2 || id.front() != 'c' || id[1] == '0') {
+        return std::nullopt;
+    }
+    std::size_t number = 0;
+    const auto end = id.data() + id.size();
+    const auto parsed = std::from_chars(id.data() + 1, end, number);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || number == 0 || number > evidenceSize) {
+        return std::nullopt;
+    }
+    return number - 1;
+}
 
 struct GenerationRequest {
     const Question& question;
     const IndexRevision& revision;
     const ModelProfile& profile;
     std::span<const Chunk> evidence;
-};
-
-struct ChunkReference {
-    DocumentId documentId;
-    std::size_t chunkId;
+    std::span<const IndexedDocument> documents;
 };
 
 class IAnswerCacheStore {
 public:
     virtual ~IAnswerCacheStore() = default;
-    virtual Result<std::optional<ChunkReference>> lookup(const GenerationRequest& request) const = 0;
-    virtual Result<bool> remember(const GenerationRequest& request, ChunkReference citation) = 0;
+    virtual Result<std::optional<GenerationResult>> lookup(const GenerationRequest& request) const = 0;
+    virtual Result<bool> remember(const GenerationRequest& request, const GenerationResult& result) = 0;
 };
 
 struct HistoryEntry {
@@ -166,7 +188,11 @@ public:
     virtual ~ILlmProvider() = default;
     // Local metadata for the configured provider, stable throughout an ask operation.
     virtual ModelProfile profile() const = 0;
-    virtual Result<ProposedCitation> generate(const GenerationRequest& request) = 0;
+    // A provider may use a prefix of the ranked context to fit its input budget.
+    virtual Result<std::size_t> evidenceCount(const GenerationRequest& request) const {
+        return request.evidence.size();
+    }
+    virtual Result<GenerationResult> generate(const GenerationRequest& request) = 0;
 };
 
 }  // namespace rag

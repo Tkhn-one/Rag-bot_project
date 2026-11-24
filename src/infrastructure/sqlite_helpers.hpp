@@ -19,24 +19,28 @@ inline bool execute(sqlite3* database, const char* sql) {
     return sqlite3_exec(database, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
 }
 
+enum class WriteMode { Immediate, AllowSavepoint };
+
 class WriteTransaction {
 public:
-    explicit WriteTransaction(sqlite3* database)
-        : database_(database), active_(execute(database, "BEGIN IMMEDIATE")) {}
+    explicit WriteTransaction(sqlite3* database, WriteMode mode = WriteMode::Immediate)
+        : database_(database),
+          nested_(mode == WriteMode::AllowSavepoint && sqlite3_get_autocommit(database_) == 0),
+          active_(execute(database_, nested_ ? "SAVEPOINT answer_write" : "BEGIN IMMEDIATE")) {}
 
     WriteTransaction(const WriteTransaction&) = delete;
     WriteTransaction& operator=(const WriteTransaction&) = delete;
 
     ~WriteTransaction() {
         if (active_) {
-            execute(database_, "ROLLBACK");
+            execute(database_, nested_ ? "ROLLBACK TO answer_write; RELEASE answer_write" : "ROLLBACK");
         }
     }
 
     bool started() const { return active_; }
 
     bool commit() {
-        if (!execute(database_, "COMMIT")) {
+        if (!execute(database_, nested_ ? "RELEASE answer_write" : "COMMIT")) {
             return false;
         }
         active_ = false;
@@ -45,6 +49,7 @@ public:
 
 private:
     sqlite3* database_;
+    bool nested_;
     bool active_;
 };
 
@@ -52,6 +57,9 @@ inline AppError databaseError(sqlite3* database, AppError fallback) {
     const auto code = sqlite3_errcode(database);
     if (code == SQLITE_CORRUPT || code == SQLITE_NOTADB) {
         return AppError::StoreCorrupt;
+    }
+    if (code == SQLITE_BUSY || code == SQLITE_LOCKED) {
+        return AppError::LibraryBusy;
     }
     return fallback;
 }

@@ -18,14 +18,63 @@ void appendDocxLayout(std::string& layout, const DocxPosition& position, std::si
     layout += std::to_string(textBytes) + ';';
 }
 
-auto findCitation(std::span<const Chunk> evidence, const ProposedCitation& citation) {
-    return std::ranges::find_if(evidence, [&](const Chunk& chunk) {
-        return chunk.documentId() == citation.documentId && chunk.line() == citation.line &&
-               chunk.chunkId() == (citation.chunkId ? citation.chunkId : citation.line) &&
-               chunk.characters() == citation.characters &&
-               chunk.page() == citation.page && chunk.docx() == citation.docx &&
-               chunk.text() == citation.quote;
-    });
+bool isContinuation(char byte) {
+    return (static_cast<unsigned char>(byte) & 0xc0) == 0x80;
+}
+
+std::size_t characterCount(std::string_view text) {
+    return static_cast<std::size_t>(std::ranges::count_if(text, [](char byte) {
+        return !isContinuation(byte);
+    }));
+}
+
+Result<Answer> resolveAnswer(const GenerationRequest& request, const GenerationResult& result) {
+    const auto* answered = std::get_if<Answered>(&result.value);
+    if (!answered) {
+        return Answer({}, result.fromCache);
+    }
+    if (answered->claims.empty()) {
+        return AppError::InvalidGeneration;
+    }
+
+    std::vector<CitedClaim> claims;
+    claims.reserve(answered->claims.size());
+    for (const auto& claim : answered->claims) {
+        if (claim.text.find_first_not_of(" \t\r\n\f\v") == std::string::npos) {
+            return AppError::InvalidGeneration;
+        }
+        const auto index = contextChunkIndex(claim.chunkId, request.evidence.size());
+        if (!index || claim.quote.find_first_not_of(" \t\r\n\f\v") == std::string::npos) {
+            return AppError::InvalidCitation;
+        }
+        const auto& chunk = request.evidence[*index];
+        const std::string_view text = chunk.text();
+        const auto begin = text.find(claim.quote);
+        if (begin == std::string_view::npos) {
+            return AppError::InvalidCitation;
+        }
+        const auto end = begin + claim.quote.size();
+        if (isContinuation(text[begin]) || (end < text.size() && isContinuation(text[end]))) {
+            return AppError::InvalidCitation;
+        }
+
+        const auto document = std::ranges::find(request.documents, chunk.documentId(), &IndexedDocument::id);
+        if (document == request.documents.end()) {
+            return AppError::InvalidCitation;
+        }
+        auto range = chunk.characters();
+        if (claim.quote.size() != text.size()) {
+            if (text.find(claim.quote, begin + 1) == std::string_view::npos) {
+                const auto first = (range ? range->first : 1) + characterCount(text.substr(0, begin));
+                range = CharacterRange{first, first + characterCount(claim.quote) - 1};
+            } else if (!range) {
+                range = CharacterRange{1, characterCount(text)};
+            }
+        }
+        claims.push_back({claim.text, Citation(document->source(),
+            Chunk(chunk.documentId(), chunk.line(), claim.quote, chunk.page(), chunk.docx(), chunk.chunkId(), range))});
+    }
+    return Answer(std::move(claims), result.fromCache);
 }
 
 }  // namespace
@@ -102,36 +151,41 @@ Result<ImportReport> IndexingService::import(const std::filesystem::path& path) 
     return ImportReport{std::get<std::size_t>(saved), std::move(pagesWithoutText), extracted.incomplete};
 }
 
-Result<ProposedCitation> ValidatingLlmProvider::generate(const GenerationRequest& request) {
-    auto result = inner_.generate(request);
-    if (auto* citation = std::get_if<ProposedCitation>(&result)) {
-        const auto match = findCitation(request.evidence, *citation);
-        if (match == request.evidence.end()) {
-            return AppError::InvalidCitation;
+Result<GenerationResult> ValidatingLlmProvider::generate(const GenerationRequest& request) {
+    const auto count = inner_.evidenceCount(request);
+    if (const auto* error = std::get_if<AppError>(&count)) {
+        return *error;
+    }
+    const auto size = std::get<std::size_t>(count);
+    if (size > request.evidence.size()) {
+        return AppError::InvalidGeneration;
+    }
+    auto sent = request;
+    sent.evidence = request.evidence.first(size);
+    auto result = inner_.generate(sent);
+    if (auto* generated = std::get_if<GenerationResult>(&result)) {
+        generated->fromCache = false;
+        const auto answer = resolveAnswer(sent, *generated);
+        if (const auto* error = std::get_if<AppError>(&answer)) {
+            return *error;
         }
-        *citation = ProposedCitation::fromChunk(*match);
     }
     return result;
 }
 
-Result<ProposedCitation> CachingLlmProvider::generate(const GenerationRequest& request) {
-    const auto cached = cache_.lookup(request);
+Result<GenerationResult> CachingLlmProvider::generate(const GenerationRequest& request) {
+    auto cached = cache_.lookup(request);
     if (const auto* error = std::get_if<AppError>(&cached)) {
         return *error;
     }
-    if (const auto& ref = std::get<std::optional<ChunkReference>>(cached)) {
-        const auto match = std::ranges::find_if(request.evidence, [&](const Chunk& chunk) {
-            return chunk.documentId() == ref->documentId && chunk.chunkId() == ref->chunkId;
-        });
-        if (match == request.evidence.end()) {
-            return AppError::StoreCorrupt;
-        }
-        return ProposedCitation::fromChunk(*match, true);
+    if (auto& hit = std::get<std::optional<GenerationResult>>(cached)) {
+        hit->fromCache = true;
+        return std::move(*hit);
     }
 
     auto result = validated_.generate(request);
-    if (const auto* citation = std::get_if<ProposedCitation>(&result)) {
-        const auto saved = cache_.remember(request, {citation->documentId, citation->chunkId});
+    if (const auto* generated = std::get_if<GenerationResult>(&result)) {
+        const auto saved = cache_.remember(request, *generated);
         if (const auto* error = std::get_if<AppError>(&saved)) {
             return *error;
         }
@@ -145,6 +199,16 @@ Result<Answer> RagService::ask(std::string text) {
         return *error;
     }
 
+    const auto& query = std::get<Question>(question);
+    const auto profile = provider_.profile();
+    if (profile.processing == ProcessingType::Remote) {
+        return store_.runRemoteQuestion([&] { return askWithProfile(text, query, profile); });
+    }
+    return askWithProfile(text, query, profile);
+}
+
+Result<Answer> RagService::askWithProfile(const std::string& text, const Question& query,
+                                         const ModelProfile& profile) {
     const auto snapshot = store_.snapshot();
     if (const auto* error = std::get_if<AppError>(&snapshot)) {
         return *error;
@@ -152,8 +216,7 @@ Result<Answer> RagService::ask(std::string text) {
 
     const auto& library = std::get<LibrarySnapshot>(snapshot);
     const auto& documents = library.documents;
-    const auto profile = provider_.profile();
-    if (profile.processing != ProcessingType::Local &&
+    if (profile.processing == ProcessingType::Remote &&
         (library.policy != DocumentPolicy::AllowRemote ||
          !std::ranges::all_of(documents, [](const IndexedDocument& document) {
              return document.policy() == DocumentPolicy::AllowRemote;
@@ -173,7 +236,6 @@ Result<Answer> RagService::ask(std::string text) {
         return complete(Answer{});
     }
 
-    const auto& query = std::get<Question>(question);
     const auto retrieved = retriever_.retrieve(query, library);
     if (const auto* error = std::get_if<AppError>(&retrieved)) {
         return *error;
@@ -183,24 +245,19 @@ Result<Answer> RagService::ask(std::string text) {
         return complete(Answer{});
     }
 
-    const auto proposed = provider_.generate({query, library.revision, profile, evidence});
+    const GenerationRequest request{query, library.revision, profile, evidence, documents};
+    const auto proposed = provider_.generate(request);
     if (const auto* error = std::get_if<AppError>(&proposed)) {
         return *error;
     }
 
-    const auto& citation = std::get<ProposedCitation>(proposed);
-    const std::span<const Chunk> candidates = evidence;
-    const auto match = findCitation(candidates, citation);
-    if (match == candidates.end()) {
-        return AppError::InvalidCitation;
+    const auto& generated = std::get<GenerationResult>(proposed);
+    auto answer = resolveAnswer(request, generated);
+    if (const auto* error = std::get_if<AppError>(&answer)) {
+        return generated.fromCache ? AppError::StoreCorrupt : *error;
     }
 
-    const auto document = std::ranges::find(documents, match->documentId(), &IndexedDocument::id);
-    if (document == documents.end()) {
-        return AppError::InvalidCitation;
-    }
-
-    return complete(Answer(Citation(document->source(), *match), citation.fromCache));
+    return complete(std::get<Answer>(std::move(answer)));
 }
 
 }  // namespace rag
