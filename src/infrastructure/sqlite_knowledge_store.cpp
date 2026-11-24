@@ -1,7 +1,7 @@
 #include "rag/infrastructure/sqlite_knowledge_store.hpp"
 #include "rag/infrastructure/utf8.hpp"
 #include "cache_key.hpp"
-#include "rag/application/block_slices.hpp"
+#include "rag/infrastructure/block_slices.hpp"
 #include "sqlite_search.hpp"
 #include "sqlite_helpers.hpp"
 
@@ -12,7 +12,7 @@ namespace rag {
 namespace {
 
 constexpr int applicationId = 0x52414742;  // RAGB
-constexpr int schemaVersion = 7;
+constexpr int schemaVersion = 8;
 constexpr auto createV2Schema = R"sql(
     CREATE TABLE documents (
         id INTEGER PRIMARY KEY,
@@ -102,6 +102,13 @@ constexpr auto addSourceBlocks = R"sql(
     PRAGMA user_version=7;
 )sql";
 
+// The publisher now indexes only complete unicode61 terms from each source block.
+constexpr auto indexWholeTerms = R"sql(
+    DROP TRIGGER index_chunk;
+    UPDATE search_profile SET settings=replace(settings,'/blocks400-60-v1','/blocks400-60-v2') WHERE dimension=0;
+    PRAGMA user_version=8;
+)sql";
+
 struct Schema {
     int application;
     int version;
@@ -141,7 +148,7 @@ std::optional<AppError> initializeSchema(sqlite3* database) {
         }
         if (!execute(database, createV2Schema) || !execute(database, addDocxPositions) ||
             !execute(database, addLibraryMetadata) || !execute(database, addCacheAndHistory) ||
-            !execute(database, createSearchIndex) || !execute(database, addSourceBlocks)) {
+            !execute(database, createSearchIndex) || !execute(database, addSourceBlocks) || !execute(database, indexWholeTerms)) {
             return databaseError(database, AppError::StoreWriteFailed);
         }
     }
@@ -259,7 +266,8 @@ std::optional<AppError> migrateLegacy(sqlite3* database, const std::filesystem::
             (schema->version <= 3 && !execute(database, addLibraryMetadata)) ||
             (schema->version <= 4 && !execute(database, addCacheAndHistory)) ||
             (schema->version <= 5 && !execute(database, createSearchIndex)) ||
-            !execute(database, addSourceBlocks) ||
+            (schema->version <= 6 && !execute(database, addSourceBlocks)) ||
+            !execute(database, indexWholeTerms) ||
             (schema->version >= 4 && !execute(database, "UPDATE library SET revision = revision + 1 WHERE id=1"))) {
             return databaseError(database, AppError::StoreMigrationFailed);
         }
@@ -458,7 +466,8 @@ Result<std::size_t> publishBlocks(sqlite3* db, std::optional<sqlite3_int64> docu
         INSERT INTO chunks (document_id,line,text,page,docx_part,docx_paragraph,docx_table,docx_row,docx_cell,
                             source_line,first_char,last_char) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
     )sql");
-    if (!rows || !insert || (document && sqlite3_bind_int64(rows.get(), 1, *document) != SQLITE_OK))
+    auto fts = prepare(db, "INSERT INTO chunks_fts(document_id,line,text) VALUES(?1,?2,?3)");
+    if (!rows || !insert || !fts || (document && sqlite3_bind_int64(rows.get(), 1, *document) != SQLITE_OK))
         return AppError::StoreWriteFailed;
     std::size_t count = 0, chunkId = 0;
     sqlite3_int64 previousDocument = 0;
@@ -468,7 +477,7 @@ Result<std::size_t> publishBlocks(sqlite3* db, std::optional<sqlite3_int64> docu
         const auto source = readChunk(rows.get(), static_cast<DocumentId>(id));
         if (const auto* error = std::get_if<AppError>(&source)) return *error;
         const auto& block = std::get<Chunk>(source);
-        const auto slices = splitBlock(block.text(), embeddings);
+        const auto slices = splitBlock(block.text(), embeddings, db);
         if (const auto* error = std::get_if<AppError>(&slices)) return *error;
         if (previousDocument != id) chunkId = 0;
         previousDocument = id;
@@ -482,6 +491,10 @@ Result<std::size_t> publishBlocks(sqlite3* db, std::optional<sqlite3_int64> docu
                 !bindPositionNumber(row, 11, range ? std::optional(range->first) : std::nullopt) ||
                 !bindPositionNumber(row, 12, range ? std::optional(range->last) : std::nullopt) ||
                 sqlite3_step(row) != SQLITE_DONE || sqlite3_reset(row) != SQLITE_OK) return AppError::StoreWriteFailed;
+            if (piece.wholeTerms &&
+                (sqlite3_bind_int64(fts.get(), 1, id) != SQLITE_OK || !bindPositionNumber(fts.get(), 2, chunkId) ||
+                 !bindText(fts.get(), 3, piece.text) || sqlite3_step(fts.get()) != SQLITE_DONE ||
+                 sqlite3_reset(fts.get()) != SQLITE_OK)) return AppError::StoreWriteFailed;
             if (embeddings) {
                 const auto indexed = indexVector(db, *embeddings, id, chunkId, piece.text);
                 if (const auto* error = std::get_if<AppError>(&indexed)) return *error;

@@ -93,10 +93,11 @@ add_library(rag_domain INTERFACE)
 target_include_directories(rag_domain INTERFACE include)
 target_compile_features(rag_domain INTERFACE cxx_std_20)
 
-add_library(rag_application src/application/services.cpp src/application/block_slices.cpp)
+add_library(rag_application src/application/services.cpp)
 target_link_libraries(rag_application PUBLIC rag_domain)
 
 add_library(rag_infrastructure
+    src/infrastructure/block_slices.cpp
     src/infrastructure/local_embeddings.cpp
     src/infrastructure/cache_key.cpp
     src/infrastructure/txt_reader.cpp
@@ -150,8 +151,8 @@ if(BUILD_TESTING)
     add_executable(rag_sqlite_tests tests/sqlite_tests.cpp)
     target_link_libraries(rag_sqlite_tests PRIVATE rag_infrastructure rag_sqlite)
     foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure
-                          migration_v2 migration_v3 migration_v4 migration_v5 migration_v6 policy_revisions
-                          cache_history cache_access_errors hybrid_search rrf long_blocks split_positions)
+                          migration_v2 migration_v3 migration_v4 migration_v5 migration_v6 migration_v7 policy_revisions
+                          cache_history cache_access_errors hybrid_search rrf long_blocks split_positions whole_terms)
         add_test(NAME sqlite_${case}
                  COMMAND rag_sqlite_tests ${case} "${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
                          "${CMAKE_CURRENT_BINARY_DIR}")

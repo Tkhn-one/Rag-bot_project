@@ -346,7 +346,7 @@ void migrate(const fs::path& directory) {
     createLegacyLibrary(path);
     const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 7, "opened database must advance to v7");
+    require(fixtureScalar(path, "PRAGMA user_version") == 8, "opened database must advance to v8");
     require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
                 fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
             "backup must retain the v1 schema, document ID and line");
@@ -404,7 +404,7 @@ void migratePdfEra(const fs::path& directory) {
             (42, 1, 'Orion snapshot runs every Friday.', 2);
     )sql");
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 7, "v2 must advance to v7");
+    require(fixtureScalar(path, "PRAGMA user_version") == 8, "v2 must advance to v8");
     const auto backup = directory / "pdf-era.sqlite.v2-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 2 &&
                 fixtureScalar(backup, "SELECT page FROM chunks WHERE document_id = 42") == 2,
@@ -445,7 +445,7 @@ void migrateDocxEra(const fs::path& directory) {
     const auto backup = directory / "docx-era.sqlite.v3-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 3 &&
                 fixtureScalar(backup, "SELECT docx_row FROM chunks WHERE document_id = 17 AND line = 2") == 2 &&
-                fixtureScalar(path, "PRAGMA user_version") == 7, "migration must preserve a readable v3 backup");
+                fixtureScalar(path, "PRAGMA user_version") == 8, "migration must preserve a readable v3 backup");
     const auto snapshot = requireValue(store->snapshot(), "reading migrated v3 library");
     require(snapshot.revision.number == 0 && snapshot.policy == DocumentPolicy::LocalOnly &&
                 snapshot.documents.size() == 1, "migration starts a closed library at its baseline revision");
@@ -481,22 +481,25 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int ver
                     "old keyword profile must have its own completed answer");
         }
     }
-    executeFixtureSql(path, "DROP TABLE source_blocks; ALTER TABLE chunks DROP COLUMN last_char;"
+    if (version <= 6) executeFixtureSql(path, "DROP TABLE source_blocks; ALTER TABLE chunks DROP COLUMN last_char;"
                             "ALTER TABLE chunks DROP COLUMN first_char; ALTER TABLE chunks DROP COLUMN source_line;"
                             "ALTER TABLE history DROP COLUMN last_char; ALTER TABLE history DROP COLUMN first_char;");
     if (version <= 5) {
-        executeFixtureSql(path, "DROP TRIGGER index_chunk; DROP TABLE chunks_fts; DROP TABLE embeddings; DROP TABLE search_profile");
+        executeFixtureSql(path, "DROP TABLE chunks_fts; DROP TABLE embeddings; DROP TABLE search_profile");
         executeFixtureSql(path, version == 4 ? "DROP TABLE answer_cache; DROP TABLE history; PRAGMA user_version = 4"
                                              : "PRAGMA user_version = 5");
     } else {
-        executeFixtureSql(path, "UPDATE search_profile SET settings='unicode61-bm25-cos-rrf-v1/20/60/8/2'; PRAGMA user_version=6");
+        executeFixtureSql(path, "CREATE TRIGGER index_chunk AFTER INSERT ON chunks BEGIN "
+                                "INSERT INTO chunks_fts(text,document_id,line) VALUES(NEW.text,NEW.document_id,NEW.line); END;");
+        executeFixtureSql(path, version == 6 ? "UPDATE search_profile SET settings='unicode61-bm25-cos-rrf-v1/20/60/8/2'; PRAGMA user_version=6"
+                                             : "UPDATE search_profile SET settings=replace(settings,'-v2','-v1'); PRAGMA user_version=7");
     }
     const auto migrated = openStore(path);
     const auto backup = directory / ("revision-era.sqlite.v" + std::to_string(version) + "-backup") / "library.sqlite";
     ++previous.number;  // Migration publishes a new index format.
     require(fixtureScalar(backup, "PRAGMA user_version") == version &&
                 fixtureScalar(backup, "SELECT count(*) FROM documents") == 1 &&
-                fixtureScalar(path, "PRAGMA user_version") == 7 &&
+                fixtureScalar(path, "PRAGMA user_version") == 8 &&
                 fixtureScalar(path, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'копирование'") == 1 &&
                 requireValue(migrated->snapshot(), "reading the migrated revision").revision == previous,
             "migration must back up the database, populate FTS and publish a new revision");
@@ -761,6 +764,49 @@ void splitPositions(const fs::path& directory) {
     }
 }
 
+void wholeTerms(const fs::path& directory) {
+    const auto path = directory / "terms.sqlite";
+    const auto prefix = [](std::size_t bytes) {
+        std::string result;
+        while (result.size() + 2 <= bytes) result += "a ";
+        result.resize(bytes, ' ');
+        return result;
+    };
+    const auto file = directory / "terms.txt";
+    // With the old 400/60 cuts, the first end and the second overlap start both create "15000".
+    const std::string amount = prefix(395) + "150000 руб.";
+    writeFixture(file, amount + "\n" + prefix(339) + "915000 " + prefix(90) +
+                 "\n" + prefix(394) + "оплата" + "\n" + std::string(405, '7') + " маркер");
+    const TxtReader reader;
+    auto store = openStore(path);
+    requireValue(IndexingService(reader, *store).import(file), "importing amounts near both cut positions");
+    store.reset();
+    store = openStore(path);
+    MockProvider mock;
+    RagService rag(*store, *store, mock);
+    const auto checkAmount = [&] {
+        const auto a = requireValue(rag.ask("150000"), "searching for the exact amount");
+        require(a.citation() && a.citation()->line() == 1 && a.citation()->characters() &&
+                a.citation()->quote().find("150000") != std::string::npos, "exact amount must remain citable");
+        const auto range = *a.citation()->characters();
+        require(decodeUtf8(a.citation()->quote()).value() ==
+                    decodeUtf8(amount).value().substr(range.first - 1, range.last - range.first + 1),
+                "amount citation must point to the original characters");
+    };
+    checkAmount();
+    for (const char* absent : {"15000", "опл", "77777"}) {
+        require(!requireValue(rag.ask(absent), "searching for a cut term").citation(), "FTS found an invented term");
+    }
+    for (const char* present : {"915000", "оплата", "маркер"}) {
+        require(requireValue(rag.ask(present), "searching for an intact term").citation().has_value(), "FTS lost a term");
+    }
+    FixtureEmbeddings embeddings;
+    requireValue(store->configureSearch(&embeddings, {}, true), "reindexing the boundary fixture with embeddings");
+    checkAmount();
+    require(fixtureScalar(path, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH '15000 OR опл OR 77777'") == 0,
+            "hybrid lexical candidates must also contain only whole terms");
+}
+
 void labelledContext(const fs::path& directory, const fs::path& demo, const IEmbeddingProvider& model) {
     auto store = openStore(directory / "context.sqlite");
     requireValue(store->configureSearch(&model), "activating Qwen");
@@ -906,10 +952,14 @@ int wmain(int argc, wchar_t* argv[]) {
             migrateRevisionEra(directory.path(), argv[2], 5);
         } else if (test == L"migration_v6") {
             migrateRevisionEra(directory.path(), argv[2], 6);
+        } else if (test == L"migration_v7") {
+            migrateRevisionEra(directory.path(), argv[2], 7);
         } else if (test == L"long_blocks") {
             longBlocks(directory.path(), FixtureEmbeddings{});
         } else if (test == L"split_positions") {
             splitPositions(directory.path());
+        } else if (test == L"whole_terms") {
+            wholeTerms(directory.path());
         } else if (test == L"real_chunks" && argc == 5) {
             const auto model = requireValue(openLocalEmbeddings(argv[4]), "loading local GGUF");
             longBlocks(directory.path(), *model);

@@ -1,5 +1,6 @@
 #include "rag/infrastructure/sqlite_knowledge_store.hpp"
 #include "sqlite_helpers.hpp"
+#include "sqlite_tokenizer.hpp"
 #include "sqlite_search.hpp"
 
 #include <algorithm>
@@ -21,7 +22,7 @@ bool higher(const Ranked& a, const Ranked& b) {
 
 std::string settingsId(SearchSettings s) {
     return "unicode61-bm25-cos-rrf-v1/" + std::to_string(s.candidates) + "/" + std::to_string(s.rrfConstant) +
-           "/" + std::to_string(s.contextLimit) + "/" + std::to_string(s.perDocument) + "/blocks400-60-v1";
+           "/" + std::to_string(s.contextLimit) + "/" + std::to_string(s.perDocument) + "/blocks400-60-v2";
 }
 
 Result<std::vector<float>> normalized(const IEmbeddingProvider& provider, std::string_view text, EmbeddingInput input) {
@@ -59,20 +60,8 @@ int appendToken(void* context, int, const char* token, int size, int, int) {
 }
 
 Result<std::vector<Key>> lexicalRanks(sqlite3* db, const Question& question, int limit) {
-    fts5_api* api = nullptr;
-    auto getApi = prepare(db, "SELECT fts5(?1)");
-    if (!getApi || sqlite3_bind_pointer(getApi.get(), 1, &api, "fts5_api_ptr", nullptr) != SQLITE_OK ||
-        sqlite3_step(getApi.get()) != SQLITE_ROW || !api) return AppError::StoreReadFailed;
-    void* context = nullptr;
-    fts5_tokenizer tokenizer{};
-    Fts5Tokenizer* instance = nullptr;
-    if (api->xFindTokenizer(api, "unicode61", &context, &tokenizer) != SQLITE_OK ||
-        tokenizer.xCreate(context, nullptr, 0, &instance) != SQLITE_OK) return AppError::StoreReadFailed;
-    const std::unique_ptr<Fts5Tokenizer, decltype(tokenizer.xDelete)> owner(instance, tokenizer.xDelete);
     std::string expression;
-    if (!std::in_range<int>(question.text().size()) ||
-        tokenizer.xTokenize(instance, &expression, FTS5_TOKENIZE_QUERY, question.text().data(),
-                            static_cast<int>(question.text().size()), appendToken) != SQLITE_OK) {
+    if (!tokenizeUnicode61(db, question.text(), FTS5_TOKENIZE_QUERY, &expression, appendToken)) {
         return AppError::StoreReadFailed;
     }
     std::vector<Key> keys;

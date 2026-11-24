@@ -1,7 +1,7 @@
 #pragma once
 
 #include "rag/application/ports.hpp"
-#include "rag/application/block_slices.hpp"
+#include "rag/infrastructure/block_slices.hpp"
 
 #include <algorithm>
 #include <random>
