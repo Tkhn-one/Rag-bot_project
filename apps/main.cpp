@@ -1,6 +1,8 @@
 #include "rag/application/services.hpp"
 #include "rag/infrastructure/adapters.hpp"
 #include "rag/infrastructure/local_embeddings.hpp"
+#include "rag/infrastructure/local_llama_provider.hpp"
+#include "rag/infrastructure/local_path.hpp"
 #include "rag/infrastructure/remote_api_provider.hpp"
 #include "rag/infrastructure/sqlite_knowledge_store.hpp"
 #include "rag/infrastructure/utf8.hpp"
@@ -61,6 +63,7 @@ int usage() {
     print(STD_ERROR_HANDLE, std::cerr,
           "Использование: rag_cli <файл.txt|pdf|docx> [<ещё-файл> ...] \"<вопрос>\"\n"
           "               rag_cli --db <база> [--embedding-model <GGUF>] [<файл> ...] \"<вопрос>\"\n"
+          "               rag_cli --db <база> [--embedding-model <GGUF>] --local-model <GGUF> [<файл> ...] \"<вопрос>\"\n"
           "               rag_cli --db <база> [--embedding-model <GGUF>] --openai\n"
           "                       [--model <ID>] [--dev-env-key] [--credential-scope <метка>] \"<вопрос>\"\n"
           "               rag_cli --documents <база>\n"
@@ -137,6 +140,15 @@ int wmain(int argc, wchar_t* argv[]) {
 
     const bool openAi = command == L"--db" && argc > firstFile &&
                         std::wstring_view(argv[firstFile]) == L"--openai";
+    const wchar_t* generationModel = nullptr;
+    if (command == L"--db" && argc > firstFile && std::wstring_view(argv[firstFile]) == L"--local-model") {
+        if (firstFile + 2 >= argc || std::wstring_view(argv[firstFile + 1]).starts_with(L"--")) return usage();
+        generationModel = argv[firstFile + 1];
+        firstFile += 2;
+        for (int i = firstFile; i < argc; ++i) {
+            if (std::wstring_view(argv[i]).starts_with(L"--")) return usage();
+        }
+    }
     auto keySource = rag::ApiKeySource::CredentialManager;
     std::optional<std::string> modelId;
     std::optional<std::string> credentialScope;
@@ -163,6 +175,18 @@ int wmain(int argc, wchar_t* argv[]) {
         return usage();
     }
 
+    if (generationModel || historyCommand) {
+        if (!rag::isLocalStoragePath(argv[2], true)) {
+            print(STD_ERROR_HANDLE, std::cerr, "Укажите базу на локальном диске.\n");
+            return 1;
+        }
+        for (int i = firstFile; i < argc - 1; ++i) {
+            if (!rag::isLocalStoragePath(argv[i], true)) {
+                print(STD_ERROR_HANDLE, std::cerr, "Для локального импорта укажите файл на локальном диске.\n");
+                return 1;
+            }
+        }
+    }
     auto opened = useDatabase ? rag::SqliteKnowledgeStore::open(argv[2], command == L"--db" && !openAi)
                               : rag::SqliteKnowledgeStore::openInMemory();
     if (const auto* error = std::get_if<rag::AppError>(&opened)) {
@@ -204,24 +228,36 @@ int wmain(int argc, wchar_t* argv[]) {
         return 2;
     }
 
-    const DocumentReader reader;
-    rag::MockProvider mock;
-    rag::WinHttpTransport transport;
-    const rag::WindowsOpenAiSecrets secrets(keySource);
-    const std::string scopePrefix = keySource == rag::ApiKeySource::CredentialManager ? "windows:" : "env:";
-    rag::RemoteApiProvider remote(transport, secrets,
-                                  modelId.value_or(std::string(rag::RemoteApiProvider::defaultModel)),
-                                  scopePrefix + credentialScope.value_or("default"));
-    rag::ILlmProvider& provider = openAi ? static_cast<rag::ILlmProvider&>(remote)
-                                       : static_cast<rag::ILlmProvider&>(mock);
-    rag::ValidatingLlmProvider validated(provider);
-    rag::CachingLlmProvider cached(validated, *store);
-    rag::IndexingService index(reader, *store);
-    rag::RagService service(*store, *store, cached, store.get());
+    auto runQuestion = [&](rag::ILlmProvider& provider) {
+        const DocumentReader reader;
+        rag::IndexingService index(reader, *store);
+        rag::ValidatingLlmProvider validated(provider);
+        rag::CachingLlmProvider cached(validated, *store);
+        rag::RagService service(*store, *store, cached, store.get());
+        const std::vector<std::filesystem::path> files(argv + firstFile, argv + argc - 1);
+        const auto status = rag::runCli(index, service, files, *question, provider.profile(), output, errors);
+        print(STD_OUTPUT_HANDLE, std::cout, output.str());
+        print(STD_ERROR_HANDLE, std::cerr, errors.str());
+        return status;
+    };
 
-    const std::vector<std::filesystem::path> files(argv + firstFile, argv + argc - 1);
-    const auto status = rag::runCli(index, service, files, *question, provider.profile().processing, output, errors);
-    print(STD_OUTPUT_HANDLE, std::cout, output.str());
-    print(STD_ERROR_HANDLE, std::cerr, errors.str());
-    return status;
+    if (generationModel) {
+        auto loaded = rag::openLocalLlama(generationModel);
+        if (const auto* error = std::get_if<rag::AppError>(&loaded)) {
+            print(STD_ERROR_HANDLE, std::cerr, std::string(rag::describeError(*error)) + '\n');
+            return 1;
+        }
+        return runQuestion(*std::get<std::unique_ptr<rag::ILlmProvider>>(loaded));
+    }
+    if (openAi) {
+        rag::WinHttpTransport transport;
+        const rag::WindowsOpenAiSecrets secrets(keySource);
+        const std::string scopePrefix = keySource == rag::ApiKeySource::CredentialManager ? "windows:" : "env:";
+        rag::RemoteApiProvider remote(transport, secrets,
+                                      modelId.value_or(std::string(rag::RemoteApiProvider::defaultModel)),
+                                      scopePrefix + credentialScope.value_or("default"));
+        return runQuestion(remote);
+    }
+    rag::MockProvider mock;
+    return runQuestion(mock);
 }

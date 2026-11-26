@@ -21,6 +21,6 @@ int runPolicyCli(IKnowledgeStore& store, std::optional<DocumentId> document, std
                  std::ostream& output, std::ostream& errors);
 
 int runCli(IndexingService& index, RagService& rag, std::span<const std::filesystem::path> files,
-           std::string question, ProcessingType processing, std::ostream& output, std::ostream& errors);
+           std::string question, const ModelProfile& profile, std::ostream& output, std::ostream& errors);
 
 }  // namespace rag

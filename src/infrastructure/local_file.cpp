@@ -1,9 +1,34 @@
 #include "local_file.hpp"
+#include "rag/infrastructure/local_path.hpp"
+
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 #include <algorithm>
 #include <fstream>
 
 namespace rag {
+
+bool isLocalStoragePath(const std::filesystem::path& input, bool allowMissingFile) {
+    std::error_code ec;
+    const auto path = std::filesystem::absolute(input, ec).lexically_normal();
+    if (ec || path.native().starts_with(L"\\\\") || path.native().find(L':', 2) != std::wstring::npos)
+        return false;
+    const auto drive = GetDriveTypeW(path.root_path().c_str());
+    if (drive != DRIVE_FIXED && drive != DRIVE_REMOVABLE && drive != DRIVE_RAMDISK) return false;
+    auto prefix = path.root_path();
+    for (const auto& part : path.relative_path()) {
+        prefix /= part;
+        const auto attrs = GetFileAttributesW(prefix.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            const auto reason = GetLastError();
+            return allowMissingFile && prefix == path && reason == ERROR_FILE_NOT_FOUND;
+        }
+        if (attrs & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE)) return false;
+    }
+    return true;
+}
 
 bool hasExtension(const std::filesystem::path& path, std::wstring_view expected) {
     auto extension = path.extension().wstring();

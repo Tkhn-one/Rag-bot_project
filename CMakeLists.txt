@@ -3,8 +3,8 @@ project(RagBot LANGUAGES C CXX)
 
 option(BUILD_GUI "Build the Qt interface" OFF)
 option(WITH_LOCAL_LLM "Build the local generation provider" OFF)
-if(BUILD_GUI OR WITH_LOCAL_LLM)
-    message(FATAL_ERROR "This build supports CLI with MockProvider and OpenAI; Qt and local generation are pending.")
+if(BUILD_GUI)
+    message(FATAL_ERROR "The Qt interface is pending.")
 endif()
 
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -121,6 +121,8 @@ target_link_libraries(rag_application PUBLIC rag_domain)
 add_library(rag_infrastructure
     src/infrastructure/block_slices.cpp
     src/infrastructure/local_embeddings.cpp
+    src/infrastructure/local_llama_provider.cpp
+    src/infrastructure/generation_json.cpp
     src/infrastructure/cache_key.cpp
     src/infrastructure/txt_reader.cpp
     src/infrastructure/pdf_reader.cpp
@@ -136,7 +138,10 @@ add_library(rag_infrastructure
 target_link_libraries(rag_infrastructure PUBLIC rag_application
     PRIVATE rag_sqlite rag_pdfium rag_miniz rag_pugixml rag_json bcrypt winhttp advapi32)
 
-set(RAG_LLAMA_ARCHIVE "" CACHE FILEPATH "Local llama.cpp b6500 source archive for CPU embeddings")
+set(RAG_LLAMA_ARCHIVE "" CACHE FILEPATH "Local llama.cpp b6500 source archive for CPU inference")
+if(WITH_LOCAL_LLM AND NOT RAG_LLAMA_ARCHIVE)
+    message(FATAL_ERROR "WITH_LOCAL_LLM requires the pinned local RAG_LLAMA_ARCHIVE (b6500).")
+endif()
 if(RAG_LLAMA_ARCHIVE)
     if(NOT EXISTS "${RAG_LLAMA_ARCHIVE}")
         message(FATAL_ERROR "RAG_LLAMA_ARCHIVE must point to the local b6500 source archive.")
@@ -150,7 +155,11 @@ if(RAG_LLAMA_ARCHIVE)
         URL_HASH SHA256=f2a188b194f25178460eecda7a7619b34d0b53421588faa2e6f0287a96674f28)
     FetchContent_MakeAvailable(llama_runtime)
     target_link_libraries(rag_infrastructure PRIVATE llama)
+    target_sources(rag_infrastructure PRIVATE src/infrastructure/llama_runtime.cpp)
     target_compile_definitions(rag_infrastructure PRIVATE RAG_LLAMA_EMBEDDINGS)
+    if(WITH_LOCAL_LLM)
+        target_compile_definitions(rag_infrastructure PRIVATE RAG_LOCAL_GENERATION)
+    endif()
 endif()
 
 add_executable(rag_cli apps/main.cpp src/presentation/cli.cpp)
@@ -199,6 +208,26 @@ if(BUILD_TESTING)
                      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_openai_policy.cmake")
 
     set(RAG_TEST_EMBEDDING_MODEL "" CACHE FILEPATH "Local Qwen GGUF for the optional integration test")
+    set(RAG_TEST_GENERATION_MODEL "" CACHE FILEPATH "Local Qwen3-4B Q4_K_M for offline generation tests")
+    add_executable(rag_local_cli_probe apps/main.cpp src/presentation/cli.cpp tests/local_cli_probe.cpp)
+    target_link_libraries(rag_local_cli_probe PRIVATE rag_infrastructure)
+    add_dependencies(rag_local_cli_probe rag_cli)
+    set(local_cli_cases files)
+    if(WITH_LOCAL_LLM AND RAG_TEST_GENERATION_MODEL AND RAG_TEST_EMBEDDING_MODEL)
+        list(APPEND local_cli_cases offline)
+        add_executable(rag_local_tests tests/local_llama_tests.cpp)
+        target_link_libraries(rag_local_tests PRIVATE rag_infrastructure)
+        add_test(NAME local_real_generation COMMAND rag_local_tests "${CMAKE_CURRENT_SOURCE_DIR}/data/demo"
+                 "${RAG_TEST_EMBEDDING_MODEL}" "${RAG_TEST_GENERATION_MODEL}")
+    endif()
+    foreach(case IN LISTS local_cli_cases)
+        add_test(NAME cli_local_${case}
+                 COMMAND "${CMAKE_COMMAND}" "-DCLI=$<TARGET_FILE:rag_local_cli_probe>"
+                         "-DCASE=${case}" "-DGENERATOR=${WITH_LOCAL_LLM}"
+                         "-DMODEL=${RAG_TEST_GENERATION_MODEL}" "-DEMBEDDINGS=${RAG_TEST_EMBEDDING_MODEL}"
+                         "-DDEMO_DIR=${CMAKE_CURRENT_SOURCE_DIR}/data/demo" "-DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_local.cmake")
+    endforeach()
     if(RAG_TEST_EMBEDDING_MODEL AND RAG_LLAMA_ARCHIVE)
         add_test(NAME sqlite_real_chunks COMMAND rag_sqlite_tests real_chunks
                  "${CMAKE_CURRENT_SOURCE_DIR}/data/demo" "${CMAKE_CURRENT_BINARY_DIR}" "${RAG_TEST_EMBEDDING_MODEL}")

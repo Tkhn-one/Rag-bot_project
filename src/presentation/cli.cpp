@@ -53,6 +53,18 @@ std::string_view describeError(AppError error) {
         return "Библиотека занята. Повторите команду после завершения текущей операции.";
     case AppError::EmbeddingFailed:
         return "Не удалось загрузить модель или вычислить локальный вектор. Проверьте сборку, GGUF и длину фрагмента.";
+    case AppError::LocalGenerationDisabled:
+        return "Локальная генерация отключена. Используйте сборку WITH_LOCAL_LLM=ON.";
+    case AppError::LocalModelUnavailable:
+        return "GGUF генератора недоступен. Укажите обычный файл на локальном диске.";
+    case AppError::LocalModelMismatch:
+        return "Размер или SHA-256 модели отличается от официального Qwen3-4B-Q4_K_M.gguf.";
+    case AppError::LocalModelLoadFailed:
+        return "Не удалось загрузить генератор Qwen3-4B или создать контекст. Проверьте доступную память.";
+    case AppError::LocalContextTooLarge:
+        return "Вопрос и первый фрагмент превышают контекст локальной модели. Сократите вопрос.";
+    case AppError::LocalGenerationFailed:
+        return "Локальная модель не завершила ответ. Проверьте доступную память и лимит вывода.";
     case AppError::SearchProfileMismatch:
         return "Индекс изменился или использует другой профиль. Повторите вопрос с тем же GGUF либо выполните --reindex.";
     case AppError::StoreReadFailed:
@@ -110,17 +122,18 @@ void printCitation(const Citation& citation, std::ostream& output) {
     output << " (ID документа " << citation.documentId() << ")\n";
 }
 
-void printAnswer(const Answer& answer, ProcessingType processing, std::ostream& output) {
+void printAnswer(const Answer& answer, const ModelProfile& profile, std::ostream& output) {
+    const bool extractive = profile.responseFormat == "extractive-v1";
     if (answer.fromCache()) output << "Ответ из кэша.\n";
     if (answer.status() == AnswerStatus::InsufficientEvidence) {
-        output << (processing == ProcessingType::Local
+        output << (extractive
                    ? "В библиотеке не найдено подтверждения по словам вопроса.\n"
                    : "В библиотеке недостаточно подтверждений для ответа.\n");
         return;
     }
-    if (processing == ProcessingType::Local) output << "Найденный фрагмент (тестовый провайдер)\n";
+    if (extractive) output << "Найденный фрагмент (тестовый провайдер)\n";
     for (const auto& claim : answer.claims()) {
-        if (processing == ProcessingType::Remote) output << claim.text << '\n';
+        if (!extractive) output << claim.text << '\n';
         printCitation(claim.citation, output);
     }
 }
@@ -156,7 +169,7 @@ int runHistoryCli(IHistoryStore& store, bool clear, std::ostream& output, std::o
         output << '\n' << entry.timeUtc << " | " << entry.profile.modelId << " | ревизия "
                << entry.revision.number << (entry.outdated ? " (устарела)" : "") << '\n'
                << entry.question << '\n';
-        printAnswer(entry.answer, entry.profile.processing, output);
+        printAnswer(entry.answer, entry.profile, output);
     }
     return 0;
 }
@@ -192,7 +205,7 @@ int runPolicyCli(IKnowledgeStore& store, std::optional<DocumentId> document, std
 }
 
 int runCli(IndexingService& index, RagService& rag, std::span<const std::filesystem::path> files,
-           std::string question, ProcessingType processing, std::ostream& output, std::ostream& errors) {
+           std::string question, const ModelProfile& profile, std::ostream& output, std::ostream& errors) {
     std::size_t failedImports = 0;
     for (const auto& file : files) {
         const auto imported = index.import(file);
@@ -230,7 +243,7 @@ int runCli(IndexingService& index, RagService& rag, std::span<const std::filesys
         return 1;
     }
 
-    printAnswer(std::get<Answer>(result), processing, output);
+    printAnswer(std::get<Answer>(result), profile, output);
     return status;
 }
 
