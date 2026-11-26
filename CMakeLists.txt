@@ -214,7 +214,7 @@ if(BUILD_TESTING)
     add_dependencies(rag_local_cli_probe rag_cli)
     set(local_cli_cases files)
     if(WITH_LOCAL_LLM AND RAG_TEST_GENERATION_MODEL AND RAG_TEST_EMBEDDING_MODEL)
-        list(APPEND local_cli_cases offline)
+        list(APPEND local_cli_cases offline partial_import)
         add_executable(rag_local_tests tests/local_llama_tests.cpp)
         target_link_libraries(rag_local_tests PRIVATE rag_infrastructure)
         add_test(NAME local_real_generation COMMAND rag_local_tests "${CMAKE_CURRENT_SOURCE_DIR}/data/demo"

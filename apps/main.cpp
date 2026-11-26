@@ -175,17 +175,23 @@ int wmain(int argc, wchar_t* argv[]) {
         return usage();
     }
 
-    if (generationModel || historyCommand) {
-        if (!rag::isLocalStoragePath(argv[2], true)) {
-            print(STD_ERROR_HANDLE, std::cerr, "Укажите базу на локальном диске.\n");
-            return 1;
-        }
+    if ((generationModel || historyCommand) && !rag::isLocalStoragePath(argv[2], true)) {
+        print(STD_ERROR_HANDLE, std::cerr, "Укажите базу на локальном диске.\n");
+        return 1;
+    }
+    std::vector<std::filesystem::path> files;
+    bool rejectedDocument = false;
+    if (!policyCommand && !historyCommand && !reindex) {
         for (int i = firstFile; i < argc - 1; ++i) {
-            if (!rag::isLocalStoragePath(argv[i], true)) {
-                print(STD_ERROR_HANDLE, std::cerr, "Для локального импорта укажите файл на локальном диске.\n");
-                return 1;
+            if (generationModel && !rag::isLocalStoragePath(argv[i], true)) {
+                print(STD_ERROR_HANDLE, std::cerr, rag::encodeUtf8(argv[i]).value_or("<путь>") +
+                      ": для локального импорта укажите доступный файл на локальном диске.\n");
+                rejectedDocument = true;
+                continue;
             }
+            files.emplace_back(argv[i]);
         }
+        if (rejectedDocument && files.empty()) return 1;
     }
     auto opened = useDatabase ? rag::SqliteKnowledgeStore::open(argv[2], command == L"--db" && !openAi)
                               : rag::SqliteKnowledgeStore::openInMemory();
@@ -234,11 +240,10 @@ int wmain(int argc, wchar_t* argv[]) {
         rag::ValidatingLlmProvider validated(provider);
         rag::CachingLlmProvider cached(validated, *store);
         rag::RagService service(*store, *store, cached, store.get());
-        const std::vector<std::filesystem::path> files(argv + firstFile, argv + argc - 1);
         const auto status = rag::runCli(index, service, files, *question, provider.profile(), output, errors);
         print(STD_OUTPUT_HANDLE, std::cout, output.str());
         print(STD_ERROR_HANDLE, std::cerr, errors.str());
-        return status;
+        return status == 0 && rejectedDocument ? 1 : status;
     };
 
     if (generationModel) {
