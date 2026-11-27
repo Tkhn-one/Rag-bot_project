@@ -1,6 +1,8 @@
 #include "rag/infrastructure/sqlite_knowledge_store.hpp"
 #include "rag/infrastructure/utf8.hpp"
 #include "cache_key.hpp"
+#include "managed_source.hpp"
+#include "rag/application/services.hpp"
 #include "rag/infrastructure/block_slices.hpp"
 #include "sqlite_search.hpp"
 #include "sqlite_helpers.hpp"
@@ -12,7 +14,7 @@ namespace rag {
 namespace {
 
 constexpr int applicationId = 0x52414742;  // RAGB
-constexpr int schemaVersion = 9;
+constexpr int schemaVersion = 10;
 constexpr auto createV2Schema = R"sql(
     CREATE TABLE documents (
         id INTEGER PRIMARY KEY,
@@ -155,6 +157,22 @@ constexpr auto addStructuredAnswers = R"sql(
     PRAGMA user_version=9;
 )sql";
 
+// Rebuild the parent table to replace schema 9's UNIQUE(content, position_layout).
+// Child rows keep their original document IDs, including cached and historical citations.
+constexpr auto addManagedSources = R"sql(
+    CREATE TABLE documents_v10 (
+        id INTEGER PRIMARY KEY, source TEXT NOT NULL, content TEXT NOT NULL COLLATE BINARY,
+        policy INTEGER NOT NULL CHECK(policy IN (0,1)), position_layout TEXT NOT NULL,
+        sha256 TEXT UNIQUE CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+        since_revision INTEGER NOT NULL CHECK(since_revision>=0)
+    ) STRICT;
+    INSERT INTO documents_v10 SELECT id, source, content, policy, position_layout, NULL, 0 FROM documents;
+    DROP TABLE documents;
+    ALTER TABLE documents_v10 RENAME TO documents;
+    CREATE UNIQUE INDEX text_only_identity ON documents(content,position_layout) WHERE sha256 IS NULL;
+    PRAGMA user_version=10;
+)sql";
+
 struct Schema {
     int application;
     int version;
@@ -195,7 +213,8 @@ std::optional<AppError> initializeSchema(sqlite3* database) {
         if (!execute(database, createV2Schema) || !execute(database, addDocxPositions) ||
             !execute(database, addLibraryMetadata) || !execute(database, addCacheAndHistory) ||
             !execute(database, createSearchIndex) || !execute(database, addSourceBlocks) ||
-            !execute(database, indexWholeTerms) || !execute(database, addStructuredAnswers)) {
+            !execute(database, indexWholeTerms) || !execute(database, addStructuredAnswers) ||
+            !execute(database, addManagedSources)) {
             return databaseError(database, AppError::StoreWriteFailed);
         }
     }
@@ -315,7 +334,8 @@ std::optional<AppError> migrateLegacy(sqlite3* database, const std::filesystem::
             (schema->version <= 5 && !execute(database, createSearchIndex)) ||
             (schema->version <= 6 && !execute(database, addSourceBlocks)) ||
             (schema->version <= 7 && !execute(database, indexWholeTerms)) ||
-            !execute(database, addStructuredAnswers) ||
+            (schema->version <= 8 && !execute(database, addStructuredAnswers)) ||
+            !execute(database, addManagedSources) ||
             (schema->version >= 4 && schema->version <= 7 &&
              !execute(database, "UPDATE library SET revision = revision + 1 WHERE id=1"))) {
             return databaseError(database, AppError::StoreMigrationFailed);
@@ -330,6 +350,8 @@ std::optional<AppError> migrateLegacy(sqlite3* database, const std::filesystem::
             }
         }
     }
+    const auto foreignKeys = prepare(database, "PRAGMA foreign_key_check");
+    if (!foreignKeys || sqlite3_step(foreignKeys.get()) != SQLITE_DONE) return AppError::StoreMigrationFailed;
     if (!transaction.commit()) {
         return databaseError(database, AppError::StoreMigrationFailed);
     }
@@ -366,12 +388,12 @@ bool bindDocxPosition(sqlite3_stmt* statement, int first, const std::optional<Do
 }
 
 Result<std::size_t> duplicateChunkCount(sqlite3* database, const std::string& content,
-                                        const std::string& positionLayout) {
+                                        const std::string& positionLayout, const std::string& digest) {
     const auto query = prepare(database, R"sql(
         SELECT (SELECT count(*) FROM chunks WHERE document_id = documents.id)
-        FROM documents WHERE content = ?1 AND position_layout = ?2
+        FROM documents WHERE sha256 = ?3 OR (sha256 IS NULL AND ?3 = '' AND content = ?1 AND position_layout = ?2)
     )sql");
-    if (!query || !bindText(query.get(), 1, content) || !bindText(query.get(), 2, positionLayout) ||
+    if (!query || !bindText(query.get(), 1, content) || !bindText(query.get(), 2, positionLayout) || !bindText(query.get(), 3, digest) ||
         sqlite3_step(query.get()) != SQLITE_ROW) {
         return databaseError(database, AppError::StoreReadFailed);
     }
@@ -393,19 +415,20 @@ Result<std::size_t> publishBlocks(sqlite3* database, std::optional<sqlite3_int64
 Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
                                   const std::string& content, std::span<const DocumentLine> lines,
                                   DocumentPolicy policy, const std::string& positionLayout,
-                                  const IEmbeddingProvider* embeddings) {
+                                  const IEmbeddingProvider* embeddings, const std::string& digest = {}) {
     const auto document = prepare(database, R"sql(
-        INSERT INTO documents (source, content, policy, position_layout) VALUES (?1, ?2, ?3, ?4)
-        ON CONFLICT (content, position_layout) DO NOTHING
+        INSERT INTO documents (source, content, policy, position_layout, sha256, since_revision)
+        SELECT ?1, ?2, ?3, ?4, nullif(?5,''), revision+1 FROM library WHERE id=1
+        ON CONFLICT DO NOTHING
     )sql");
     if (!document || !bindText(document.get(), 1, source) || !bindText(document.get(), 2, content) ||
         sqlite3_bind_int(document.get(), 3, policy == DocumentPolicy::AllowRemote ? 1 : 0) != SQLITE_OK ||
-        !bindText(document.get(), 4, positionLayout) ||
+        !bindText(document.get(), 4, positionLayout) || !bindText(document.get(), 5, digest) ||
         sqlite3_step(document.get()) != SQLITE_DONE) {
         return databaseError(database, AppError::StoreWriteFailed);
     }
     if (sqlite3_changes(database) == 0) {
-        return duplicateChunkCount(database, content, positionLayout);
+        return duplicateChunkCount(database, content, positionLayout, digest);
     }
 
     const auto id = sqlite3_last_insert_rowid(database);
@@ -628,9 +651,12 @@ Result<std::unique_ptr<SqliteKnowledgeStore>> SqliteKnowledgeStore::open(
         return databaseError(raw, AppError::StoreReadFailed);
     }
     if (schema->migratable()) {
+        // DROP TABLE would otherwise cascade to the old parent's children.
+        if (!execute(raw, "PRAGMA foreign_keys=OFF")) return AppError::StoreMigrationFailed;
         if (const auto error = migrateLegacy(raw, absolutePath, *filename)) {
             return *error;
         }
+        if (!execute(raw, "PRAGMA foreign_keys=ON")) return AppError::StoreMigrationFailed;
     } else if (!schema->supported()) {
         if (existed || !schema->uninitialized()) {
             if (schema->uninitialized() && std::filesystem::file_size(absolutePath, pathError) == 0) {
@@ -688,6 +714,87 @@ Result<std::size_t> SqliteKnowledgeStore::save(std::string source, std::string c
         return databaseError(database_.get(), AppError::StoreWriteFailed);
     }
     return result;
+}
+
+Result<ImportReport> SqliteKnowledgeStore::importSource(const std::filesystem::path& path, const ParseSource& parse) {
+    auto* db = database_.get();
+    const char* filename = sqlite3_db_filename(db, "main");
+    if (!filename || !*filename) return IKnowledgeStore::importSource(path, parse);
+
+    WriteTransaction transaction(db);
+    if (!transaction.started()) return databaseError(db, AppError::StoreWriteFailed);
+    const auto meta = prepare(db, "SELECT library_id FROM library WHERE id=1");
+    if (!meta || sqlite3_step(meta.get()) != SQLITE_ROW) return AppError::StoreReadFailed;
+    const auto root = sourceDirectory(db, readText(meta.get(), 0).value_or(""));
+    const auto profile = searchProfileMatches(db, embeddings_, settings_);
+    if (auto* error = std::get_if<AppError>(&profile)) return *error;
+    if (!std::get<bool>(profile)) return AppError::SearchProfileMismatch;
+
+    StagedSource stage;
+    const auto copy = stage.copy(path, root);
+    if (const auto* error = std::get_if<AppError>(&copy)) return *error;
+    auto parsed = parse(stage.path());
+    if (auto* error = std::get_if<AppError>(&parsed)) return *error;
+    auto& source = std::get<ParsedSource>(parsed);
+    const auto& digest = std::get<std::string>(copy);
+    const auto name = path.filename().u8string();
+    const auto result = writeDocument(db, std::string(name.begin(), name.end()), source.content, source.lines,
+                                      DocumentPolicy::LocalOnly, source.layout, embeddings_, digest);
+    if (const auto* error = std::get_if<AppError>(&result)) return *error;
+
+    // A duplicate keeps its first display name and format.
+    auto stored = prepare(db, "SELECT source FROM documents WHERE sha256=?1");
+    if (!stored || !bindText(stored.get(), 1, digest) || sqlite3_step(stored.get()) != SQLITE_ROW)
+        return AppError::StoreReadFailed;
+    const auto ext = sourceExtension(decodeUtf8(readText(stored.get(), 0).value_or("")).value_or(L""));
+    if (ext.empty()) return AppError::StoreCorrupt;
+    auto target = root / digest;
+    target += ext;
+    if (!verifiedCopy(target, digest) && !stage.publish(target)) return AppError::StoreWriteFailed;
+    if (!transaction.commit()) return databaseError(db, AppError::StoreWriteFailed);
+    source.report.chunks = std::get<std::size_t>(result);
+    return std::move(source.report);
+}
+
+Result<CitationSource> SqliteKnowledgeStore::resolveSource(const IndexRevision& revision, const Citation& citation) const {
+    auto* db = database_.get();
+    const auto row = prepare(db, R"sql(
+        SELECT b.line,b.text,b.page,b.docx_part,b.docx_paragraph,b.docx_table,b.docx_row,b.docx_cell,
+               d.sha256,d.source
+        FROM source_blocks b JOIN documents d ON d.id=b.document_id CROSS JOIN library l
+        WHERE l.id=1 AND l.library_id=?1 AND d.id=?2 AND b.line=?3 AND ?4 BETWEEN d.since_revision AND l.revision
+    )sql");
+    if (!std::in_range<sqlite3_int64>(revision.number) || !row ||
+        !bindText(row.get(), 1, revision.libraryId) || !bindPositionNumber(row.get(), 2, citation.documentId()) ||
+        !bindPositionNumber(row.get(), 3, citation.line()) ||
+        sqlite3_bind_int64(row.get(), 4, static_cast<sqlite3_int64>(revision.number)) != SQLITE_OK)
+        return AppError::InvalidCitation;
+    const int status = sqlite3_step(row.get());
+    if (status == SQLITE_DONE) return AppError::InvalidCitation;
+    if (status != SQLITE_ROW) return databaseError(db, AppError::StoreReadFailed);
+    auto block = readChunk(row.get(), citation.documentId());
+    if (const auto* error = std::get_if<AppError>(&block)) return *error;
+    const auto& chunk = std::get<Chunk>(block);
+    if (chunk.page() != citation.page() || chunk.docx() != citation.docx() ||
+        readText(row.get(), 9) != citation.source() || citation.quote().empty()) return AppError::InvalidCitation;
+
+    const auto highlight = locateQuote(chunk.text(), citation);
+    if (const auto* error = std::get_if<AppError>(&highlight)) return *error;
+    CitationSource source{chunk.text(), std::get<CharacterRange>(highlight), CopyStatus::Legacy, {}, {}};
+    const auto digest = readText(row.get(), 8);
+    if (!digest) return source;
+    const auto root = sourceDirectory(db, revision.libraryId);
+    const auto ext = sourceExtension(decodeUtf8(citation.source()).value_or(L""));
+    if (!validDigest(*digest) || root.empty() || ext.empty()) return AppError::StoreCorrupt;
+    auto path = root / *digest;
+    path += ext;
+    source.sha256 = *digest;
+    source.copyStatus = CopyStatus::Unavailable;
+    if (verifiedCopy(path, *digest)) {
+        source.copyPath = std::move(path);
+        source.copyStatus = CopyStatus::Available;
+    }
+    return source;
 }
 
 Result<bool> SqliteKnowledgeStore::setLibraryPolicy(DocumentPolicy policy) {

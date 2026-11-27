@@ -67,11 +67,43 @@ public:
     virtual Result<ExtractedDocument> read(const std::filesystem::path& path) const = 0;
 };
 
+struct ImportReport {
+    std::size_t chunks;
+    std::vector<std::size_t> pagesWithoutText;
+    bool incomplete;
+};
+
+struct ParsedSource {
+    std::string content;
+    std::string layout;
+    std::vector<DocumentLine> lines;
+    ImportReport report;
+};
+
+enum class CopyStatus { Available, Legacy, Unavailable };
+
+struct CitationSource {
+    std::string blockText;
+    CharacterRange highlight;
+    CopyStatus copyStatus;
+    std::filesystem::path copyPath;
+    std::string sha256;
+};
+
+class ICitationSource {
+public:
+    virtual ~ICitationSource() = default;
+    virtual Result<CitationSource> resolveSource(const IndexRevision& revision, const Citation& citation) const = 0;
+};
+
 class IKnowledgeStore {
 public:
     using RemoteQuestion = std::function<Result<Answer>()>;
 
     virtual ~IKnowledgeStore() = default;
+
+    using ParseSource = std::function<Result<ParsedSource>(const std::filesystem::path&)>;
+    virtual Result<ImportReport> importSource(const std::filesystem::path& path, const ParseSource& parse);
 
     // Publish the document and its lines together. Line numbers must be positive and unique.
     // Position layout is empty for TXT. For equal text and layout, return the existing chunk count.

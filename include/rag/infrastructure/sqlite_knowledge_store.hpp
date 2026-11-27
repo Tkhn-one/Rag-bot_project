@@ -8,12 +8,14 @@ struct sqlite3;
 
 namespace rag {
 
-class SqliteKnowledgeStore final : public IKnowledgeStore, public IAnswerCacheStore, public IHistoryStore, public IRetriever {
+class SqliteKnowledgeStore final : public IKnowledgeStore, public IAnswerCacheStore, public IHistoryStore, public IRetriever, public ICitationSource {
 public:
     static Result<std::unique_ptr<SqliteKnowledgeStore>> open(const std::filesystem::path& path,
                                                               bool createIfMissing = true);
     static Result<std::unique_ptr<SqliteKnowledgeStore>> openInMemory();
 
+    Result<ImportReport> importSource(const std::filesystem::path& path, const ParseSource& parse) override;
+    Result<CitationSource> resolveSource(const IndexRevision& revision, const Citation& citation) const override;
     Result<std::size_t> save(std::string source, std::string content,
                              std::vector<DocumentLine> lines, DocumentPolicy policy,
                              std::string positionLayout = {}) override;

@@ -27,10 +27,14 @@ std::optional<CacheDigest> cacheKey(const GenerationRequest& request) {
     field(profile.responseFormat);
     field(profile.credentialScope);
 
+    return sha256(bytes);
+}
+
+std::optional<CacheDigest> sha256(std::string_view bytes) {
     CacheDigest digest;
     if (!std::in_range<ULONG>(bytes.size()) ||
         !BCRYPT_SUCCESS(BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
-            reinterpret_cast<PUCHAR>(bytes.data()), static_cast<ULONG>(bytes.size()),
+            reinterpret_cast<PUCHAR>(const_cast<char*>(bytes.data())), static_cast<ULONG>(bytes.size()),
             digest.data(), static_cast<ULONG>(digest.size())))) {
         return std::nullopt;
     }

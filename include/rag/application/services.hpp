@@ -4,11 +4,7 @@
 
 namespace rag {
 
-struct ImportReport {
-    std::size_t chunks;
-    std::vector<std::size_t> pagesWithoutText;
-    bool incomplete;
-};
+Result<CharacterRange> locateQuote(std::string_view block, const Citation& citation);
 
 class IndexingService {
 public:
@@ -18,6 +14,7 @@ public:
     Result<ImportReport> import(const std::filesystem::path& path);
 
 private:
+    Result<ParsedSource> parse(const std::filesystem::path& path) const;
     const IDocumentReader& reader_;
     IKnowledgeStore& store_;
 };

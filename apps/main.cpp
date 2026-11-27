@@ -68,6 +68,7 @@ int usage() {
           "                       [--model <ID>] [--dev-env-key] [--credential-scope <метка>] \"<вопрос>\"\n"
           "               rag_cli --documents <база>\n"
           "               rag_cli --policy <база> library|document <ID для document> allow-remote|local-only\n"
+          "               rag_cli --source <база> <номер записи истории> <номер цитаты>\n"
           "               rag_cli --history <база>\n"
           "               rag_cli --clear-history <база>\n"
           "               rag_cli --reindex <база> [--embedding-model <GGUF>]\n");
@@ -98,6 +99,27 @@ std::optional<std::string> parseProfileLabel(std::wstring_view value) {
 
 int wmain(int argc, wchar_t* argv[]) {
     const auto command = argc > 1 ? std::wstring_view(argv[1]) : std::wstring_view{};
+    if (command == L"--source") {
+        if (argc != 5) return usage();
+        const auto entry = parseDocumentId(argv[3]);
+        const auto claim = parseDocumentId(argv[4]);
+        if (!entry || !claim) return usage();
+        if (!rag::isLocalStoragePath(argv[2])) {
+            print(STD_ERROR_HANDLE, std::cerr, "Укажите существующую локальную базу.\n");
+            return 1;
+        }
+        auto opened = rag::SqliteKnowledgeStore::open(argv[2], false);
+        if (const auto* error = std::get_if<rag::AppError>(&opened)) {
+            print(STD_ERROR_HANDLE, std::cerr, std::string(rag::describeError(*error)) + '\n');
+            return 1;
+        }
+        auto& store = *std::get<std::unique_ptr<rag::SqliteKnowledgeStore>>(opened);
+        std::ostringstream output, errors;
+        const int status = rag::runSourceCli(store, store, *entry, *claim, output, errors);
+        print(STD_OUTPUT_HANDLE, std::cout, output.str());
+        print(STD_ERROR_HANDLE, std::cerr, errors.str());
+        return status;
+    }
     const bool viewHistory = command == L"--history";
     const bool clearHistory = command == L"--clear-history";
     const bool historyCommand = viewHistory || clearHistory;

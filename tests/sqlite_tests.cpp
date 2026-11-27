@@ -174,11 +174,15 @@ void duplicate(const fs::path& directory, const fs::path& demo) {
     DocumentId originalId = 0;
     {
         auto store = openStore(path);
-        requireValue(store->save("original's.txt", content, {{4, quote}}, DocumentPolicy::AllowRemote),
-                     "saving original content and explicit policy");
+        const auto original = directory / "original's.txt";
+        fs::copy_file(copy, original);
+        const TxtReader reader;
+        IndexingService index(reader, *store);
+        requireValue(index.import(original), "saving original bytes");
         const auto documents = requireValue(store->snapshot(), "reading original document").documents;
         require(documents.size() == 1, "expected only the original document");
         originalId = documents.front().id();
+        requireValue(store->setDocumentPolicy(originalId, DocumentPolicy::AllowRemote), "allowing original");
     }
     {
         const TxtReader reader;
@@ -186,7 +190,7 @@ void duplicate(const fs::path& directory, const fs::path& demo) {
         IndexingService index(reader, *store);
         require(requireValue(index.import(copy), "reimporting a renamed TXT with a BOM").chunks == 1,
                 "duplicate import must return the original chunk count");
-        require(requireValue(store->snapshot(), "reading after duplicate").revision.number == 1,
+        require(requireValue(store->snapshot(), "reading after duplicate").revision.number == 2,
                 "duplicate import must not advance the revision");
         requireValue(index.import(demo / "decisions.txt"), "importing different content");
     }
@@ -198,6 +202,122 @@ void duplicate(const fs::path& directory, const fs::path& demo) {
                 documents.back().id() != originalId && documents.back().policy() == DocumentPolicy::LocalOnly,
             "a duplicate must keep its identity and policy, and new content needs its own ID");
     requireCitation(*store, decisionsQuestion, originalId, "original's.txt", quote);
+}
+
+void managedSources(const fs::path& directory, const fs::path& demo) {
+    const auto db = directory / "library.sqlite";
+    const auto original = directory / L"копия.txt";
+    const std::string text = "😀 договор и договор";
+    writeFixture(original, text);
+    auto store = openStore(db);
+    class ReplacingReader final : public IDocumentReader {
+    public:
+        explicit ReplacingReader(fs::path original) : original_(std::move(original)) {}
+        Result<ExtractedDocument> read(const fs::path& copy) const override {
+            require(copy != original_, "the parser must receive the managed snapshot");
+            std::ofstream overwrite(copy, std::ios::binary | std::ios::app);
+            require(!overwrite, "staged bytes must stay locked while the reader runs");
+            writeFixture(original_, "external edit");
+            return TxtReader{}.read(copy);
+        }
+    private:
+        fs::path original_;
+    } replacing(original);
+    requireValue(IndexingService(replacing, *store).import(original), "importing a snapshot");
+    writeFixture(original, "\xEF\xBB\xBF" + text);
+    const TxtReader txt;
+    requireValue(IndexingService(txt, *store).import(original), "same text with different bytes");
+    const PdfReader pdf;
+    const DocxReader docx;
+    requireValue(IndexingService(pdf, *store).import(demo / "backup-protocol.pdf"), "importing PDF");
+    requireValue(IndexingService(docx, *store).import(demo / "backup-register.docx"), "importing DOCX");
+    fs::remove(original);
+    store.reset();
+    store = openStore(db);
+    const auto snapshot = requireValue(store->snapshot(), "reopening managed documents");
+    require(snapshot.documents.size() == 4 && snapshot.revision.number == 4, "byte-distinct documents need distinct IDs");
+    std::string firstHash;
+    for (const auto& document : snapshot.documents) {
+        for (const auto& chunk : document.chunks()) {
+            const Citation citation(document.source(), chunk);
+            const auto source = requireValue(store->resolveSource(snapshot.revision, citation), "resolving source");
+            require(source.copyStatus == CopyStatus::Available && fs::exists(source.copyPath) &&
+                    source.blockText.find(citation.quote()) != std::string::npos && source.sha256.size() == 64,
+                    "every format must resolve the saved block and a verified copy");
+            if (document.id() == 1) {
+                firstHash = source.sha256;
+                require(readFixture(source.copyPath) == text, "parser and stored copy must see original bytes");
+            } else if (document.id() == 2) {
+                require(source.sha256 != firstHash && readFixture(source.copyPath) == "\xEF\xBB\xBF" + text,
+                        "preserve the second byte representation");
+            } else {
+                require(readFixture(source.copyPath) == readFixture(demo / decodeUtf8(document.source()).value()),
+                        "binary source must remain byte-identical");
+                require(citation.page().has_value() || citation.docx().has_value(), "format-specific coordinates");
+            }
+        }
+    }
+    const auto& first = snapshot.documents.front();
+    Citation secondMatch(first.source(), Chunk(first.id(), 1, "договор", {}, {}, 1, CharacterRange{13,19}));
+    auto source = requireValue(store->resolveSource(snapshot.revision, secondMatch), "Unicode subrange");
+    require(source.highlight == CharacterRange{13,19}, "highlight the specified repeated quote");
+    requireError(store->resolveSource({"another-library", 4}, secondMatch), AppError::InvalidCitation, "wrong library");
+    requireError(store->resolveSource({snapshot.revision.libraryId, 0}, secondMatch), AppError::InvalidCitation,
+                 "a document cannot be cited before its publication");
+    writeFixture(source.copyPath, "changed");
+    auto damaged = requireValue(store->resolveSource(snapshot.revision, secondMatch), "changed copy");
+    require(damaged.blockText == text && damaged.copyPath.empty() && damaged.copyStatus == CopyStatus::Unavailable,
+            "never expose a substituted copy");
+    fs::remove(source.copyPath);
+    auto missing = requireValue(store->resolveSource(snapshot.revision, secondMatch), "missing copy");
+    require(missing.copyPath.empty() && missing.blockText == text, "text survives a missing file");
+}
+
+void migrateSources(const fs::path& directory, const fs::path& demo) {
+    const auto db = directory / "legacy.sqlite";
+    IndexRevision revision;
+    const TxtReader reader;
+    {
+        auto store = openStore(db);
+        requireValue(IndexingService(reader,*store).import(demo / "decisions.txt"), "seeding v9 data");
+        MockProvider mock;
+        ValidatingLlmProvider validated(mock);
+        CachingLlmProvider cached(validated,*store);
+        RagService service(*store,*store,cached,store.get());
+        requireValue(service.ask(decisionsQuestion), "seeding history and cache");
+        revision = requireValue(store->snapshot(), "revision before migration").revision;
+    }
+    executeFixtureSql(db, R"sql(
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE old_documents (
+            id INTEGER PRIMARY KEY, source TEXT NOT NULL, content TEXT NOT NULL COLLATE BINARY,
+            policy INTEGER NOT NULL CHECK(policy IN (0,1)), position_layout TEXT NOT NULL,
+            UNIQUE(content,position_layout)
+        ) STRICT;
+        INSERT INTO old_documents SELECT id,source,content,policy,position_layout FROM documents;
+        DROP TABLE documents;
+        ALTER TABLE old_documents RENAME TO documents;
+        PRAGMA user_version=9;
+    )sql");
+    auto store = openStore(db);
+    require(fixtureScalar(directory / "legacy.sqlite.v9-backup" / "library.sqlite", "PRAGMA user_version") == 9,
+            "migration must back up the original schema");
+    auto entries = requireValue(store->history(), "restoring v9 history");
+    require(entries.size() == 1 && entries[0].revision == revision && !entries[0].outdated, "keep historical revision");
+    const auto* citation = firstCitation(entries[0].answer);
+    require(citation != nullptr, "keep the v9 citation");
+    auto legacy = requireValue(store->resolveSource(revision,*citation), "resolving the v9 citation");
+    require(legacy.blockText == decisionsQuote && legacy.copyStatus == CopyStatus::Legacy && legacy.copyPath.empty(),
+            "never claim the current external file is an old source");
+    MockProvider mock;
+    ValidatingLlmProvider validated(mock);
+    CachingLlmProvider cached(validated,*store);
+    RagService service(*store,*store,cached,store.get());
+    require(requireValue(service.ask(decisionsQuestion), "reading migrated cache").fromCache(), "v9 cache survives");
+    requireValue(IndexingService(reader,*store).import(demo / "decisions.txt"), "importing a verified source");
+    require(requireValue(store->snapshot(), "reading new version").documents.size() == 2 &&
+            requireValue(store->resolveSource(revision,*citation), "old citation after reimport").copyStatus == CopyStatus::Legacy,
+            "a matching text cannot retroactively prove the old bytes");
 }
 
 void rollback(const fs::path& directory, const fs::path& demo) {
@@ -227,6 +347,12 @@ void rollback(const fs::path& directory, const fs::path& demo) {
                 "no part of the failed document should be visible");
     }
 
+    const auto sources = directory / "sources";
+    std::size_t copies = 0;
+    for (const auto& file : fs::recursive_directory_iterator(sources)) {
+        if (file.is_regular_file()) ++copies;
+    }
+    require(copies == 1, "a failed import must discard its temporary file");
     auto store = openStore(path);
     const auto afterReopen = requireValue(store->snapshot(), "reading after rollback and reopening");
     require(afterReopen.documents.size() == 1 && afterReopen.revision.number == 1,
@@ -350,7 +476,7 @@ void migrate(const fs::path& directory) {
     createLegacyLibrary(path);
     const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 9, "opened database must advance to v9");
+    require(fixtureScalar(path, "PRAGMA user_version") == 10, "opened database must advance to v10");
     require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
                 fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
             "backup must retain the v1 schema, document ID and line");
@@ -408,7 +534,7 @@ void migratePdfEra(const fs::path& directory) {
             (42, 1, 'Orion snapshot runs every Friday.', 2);
     )sql");
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 9, "v2 must advance to v9");
+    require(fixtureScalar(path, "PRAGMA user_version") == 10, "v2 must advance to v10");
     const auto backup = directory / "pdf-era.sqlite.v2-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 2 &&
                 fixtureScalar(backup, "SELECT page FROM chunks WHERE document_id = 42") == 2,
@@ -449,7 +575,7 @@ void migrateDocxEra(const fs::path& directory) {
     const auto backup = directory / "docx-era.sqlite.v3-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 3 &&
                 fixtureScalar(backup, "SELECT docx_row FROM chunks WHERE document_id = 17 AND line = 2") == 2 &&
-                fixtureScalar(path, "PRAGMA user_version") == 9, "migration must preserve a readable v3 backup");
+                fixtureScalar(path, "PRAGMA user_version") == 10, "migration must preserve a readable v3 backup");
     const auto snapshot = requireValue(store->snapshot(), "reading migrated v3 library");
     require(snapshot.revision.number == 0 && snapshot.policy == DocumentPolicy::LocalOnly &&
                 snapshot.documents.size() == 1, "migration starts a closed library at its baseline revision");
@@ -530,7 +656,7 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int ver
     if (version < 8) ++previous.number;  // Pre-v8 search formats publish a new index revision.
     require(fixtureScalar(backup, "PRAGMA user_version") == version &&
                 fixtureScalar(backup, "SELECT count(*) FROM documents") == 1 &&
-                fixtureScalar(path, "PRAGMA user_version") == 9 &&
+                fixtureScalar(path, "PRAGMA user_version") == 10 &&
                 fixtureScalar(path, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'копирование'") == 1 &&
                 requireValue(migrated->snapshot(), "reading the migrated revision").revision == previous,
             "migration must back up the database, populate FTS and publish a new revision");
@@ -977,6 +1103,10 @@ int wmain(int argc, wchar_t* argv[]) {
         const std::wstring_view test = argv[1];
         if (test == L"reopen") {
             reopen(directory.path(), argv[2]);
+        } else if (test == L"managed_sources") {
+            managedSources(directory.path(), argv[2]);
+        } else if (test == L"migration_v9") {
+            migrateSources(directory.path(), argv[2]);
         } else if (test == L"duplicate") {
             duplicate(directory.path(), argv[2]);
         } else if (test == L"rollback") {

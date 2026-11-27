@@ -124,6 +124,7 @@ add_library(rag_infrastructure
     src/infrastructure/local_llama_provider.cpp
     src/infrastructure/generation_json.cpp
     src/infrastructure/cache_key.cpp
+    src/infrastructure/managed_source.cpp
     src/infrastructure/txt_reader.cpp
     src/infrastructure/pdf_reader.cpp
     src/infrastructure/docx_reader.cpp
@@ -183,7 +184,7 @@ if(BUILD_TESTING)
     endforeach()
     add_executable(rag_sqlite_tests tests/sqlite_tests.cpp)
     target_link_libraries(rag_sqlite_tests PRIVATE rag_infrastructure rag_sqlite)
-    foreach(case IN ITEMS reopen duplicate rollback invalid_database migration migration_failure
+    foreach(case IN ITEMS reopen managed_sources migration_v9 duplicate rollback invalid_database migration migration_failure
                           migration_v2 migration_v3 migration_v4 migration_v5 migration_v6 migration_v7 migration_v8 policy_revisions
                           cache_history cache_access_errors hybrid_search rrf long_blocks split_positions whole_terms)
         add_test(NAME sqlite_${case}

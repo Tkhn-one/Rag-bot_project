@@ -144,6 +144,40 @@ std::string_view policyName(DocumentPolicy policy) {
 
 }  // namespace
 
+int runSourceCli(IHistoryStore& history, ICitationSource& sources, std::size_t entry, std::size_t claim,
+                 std::ostream& output, std::ostream& errors) {
+    const auto result = history.history();
+    if (const auto* error = std::get_if<AppError>(&result)) {
+        errors << describeError(*error) << '\n';
+        return 1;
+    }
+    const auto& entries = std::get<std::vector<HistoryEntry>>(result);
+    if (!entry || entry > entries.size() || !claim || claim > entries[entry-1].answer.claims().size()) {
+        errors << "В истории нет такой цитаты.\n";
+        return 1;
+    }
+    const auto& selected = entries[entry-1];
+    const auto& citation = selected.answer.claims()[claim-1].citation;
+    const auto resolved = sources.resolveSource(selected.revision, citation);
+    if (const auto* error = std::get_if<AppError>(&resolved)) {
+        errors << describeError(*error) << '\n';
+        return 1;
+    }
+    const auto& source = std::get<CitationSource>(resolved);
+    printCitation(citation, output);
+    output << "Сохранённый текст: " << source.blockText << "\nСимволы цитаты: "
+           << source.highlight.first << "–" << source.highlight.last << '\n';
+    if (source.copyStatus == CopyStatus::Available) {
+        const auto path = source.copyPath.u8string();
+        output << "Копия: " << std::string(path.begin(), path.end()) << '\n';
+    } else if (source.copyStatus == CopyStatus::Legacy) {
+        output << "Исходная копия для этой записи не сохранялась.\n";
+    } else {
+        output << "Копия недоступна или её содержимое изменилось.\n";
+    }
+    return 0;
+}
+
 int runHistoryCli(IHistoryStore& store, bool clear, std::ostream& output, std::ostream& errors) {
     if (clear) {
         const auto result = store.clearHistory();
@@ -165,8 +199,9 @@ int runHistoryCli(IHistoryStore& store, bool clear, std::ostream& output, std::o
     } else {
         output << "Каждый вопрос задаётся отдельно.\n";
     }
+    std::size_t ordinal = 0;
     for (const auto& entry : entries) {
-        output << '\n' << entry.timeUtc << " | " << entry.profile.modelId << " | ревизия "
+        output << '\n' << ++ordinal << ". " << entry.timeUtc << " | " << entry.profile.modelId << " | ревизия "
                << entry.revision.number << (entry.outdated ? " (устарела)" : "") << '\n'
                << entry.question << '\n';
         printAnswer(entry.answer, entry.profile, output);

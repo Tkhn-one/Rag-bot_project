@@ -79,7 +79,32 @@ Result<Answer> resolveAnswer(const GenerationRequest& request, const GenerationR
 
 }  // namespace
 
+Result<CharacterRange> locateQuote(std::string_view block, const Citation& citation) {
+    if (citation.quote().empty()) return AppError::InvalidCitation;
+    // Restrict the search to the cited slice before locating the verbatim quote.
+    std::size_t start = 0, end = block.size();
+    if (const auto range = citation.characters()) {
+        if (!range->first || range->last < range->first) return AppError::InvalidCitation;
+        std::size_t characters = 0;
+        for (std::size_t i = 0; i < block.size(); ++i) {
+            if (isContinuation(block[i])) continue;
+            ++characters;
+            if (characters == range->first) start = i;
+            if (characters > range->last) { end = i; break; }
+        }
+        if (characters < range->last) return AppError::InvalidCitation;
+    }
+    const auto match = block.substr(start, end - start).find(citation.quote());
+    if (match == block.npos) return AppError::InvalidCitation;
+    const auto first = 1 + characterCount(block.substr(0, start + match));
+    return CharacterRange{first, first + characterCount(citation.quote()) - 1};
+}
+
 Result<ImportReport> IndexingService::import(const std::filesystem::path& path) {
+    return store_.importSource(path, [this](const auto& copy) { return parse(copy); });
+}
+
+Result<ParsedSource> IndexingService::parse(const std::filesystem::path& path) const {
     auto file = reader_.read(path);
     if (const auto* error = std::get_if<AppError>(&file)) {
         return *error;
@@ -142,13 +167,22 @@ Result<ImportReport> IndexingService::import(const std::filesystem::path& path) 
         return positionLayout.empty() ? AppError::EmptyDocument : AppError::PdfNoText;
     }
 
+    return ParsedSource{std::move(content), std::move(positionLayout), std::move(lines),
+                        {0, std::move(pagesWithoutText), extracted.incomplete}};
+}
+
+Result<ImportReport> IKnowledgeStore::importSource(const std::filesystem::path& path, const ParseSource& parse) {
+    auto parsed = parse(path);
+    if (auto* error = std::get_if<AppError>(&parsed)) return *error;
+    auto& source = std::get<ParsedSource>(parsed);
     const auto filename = path.filename().u8string();
-    const auto saved = store_.save(std::string(filename.begin(), filename.end()), std::move(content),
-                                  std::move(lines), DocumentPolicy::LocalOnly, std::move(positionLayout));
+    const auto saved = save(std::string(filename.begin(), filename.end()), std::move(source.content),
+                            std::move(source.lines), DocumentPolicy::LocalOnly, std::move(source.layout));
     if (const auto* error = std::get_if<AppError>(&saved)) {
         return *error;
     }
-    return ImportReport{std::get<std::size_t>(saved), std::move(pagesWithoutText), extracted.incomplete};
+    source.report.chunks = std::get<std::size_t>(saved);
+    return std::move(source.report);
 }
 
 Result<GenerationResult> ValidatingLlmProvider::generate(const GenerationRequest& request) {
