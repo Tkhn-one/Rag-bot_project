@@ -49,6 +49,8 @@ std::string_view describeError(AppError error) {
         return "OpenAI вернул незавершённый ответ.";
     case AppError::RemoteProcessingDenied:
         return "Внешняя обработка запрещена. Для неё требуется разрешение библиотеки и каждого документа.";
+    case AppError::Cancelled:
+        return "Операция отменена.";
     case AppError::LibraryBusy:
         return "Библиотека занята. Повторите команду после завершения текущей операции.";
     case AppError::EmbeddingFailed:

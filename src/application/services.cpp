@@ -31,7 +31,7 @@ std::size_t characterCount(std::string_view text) {
 Result<Answer> resolveAnswer(const GenerationRequest& request, const GenerationResult& result) {
     const auto* answered = std::get_if<Answered>(&result.value);
     if (!answered) {
-        return Answer({}, result.fromCache);
+        return Answer({}, result.fromCache, result.context);
     }
     if (answered->claims.empty()) {
         return AppError::InvalidGeneration;
@@ -74,7 +74,7 @@ Result<Answer> resolveAnswer(const GenerationRequest& request, const GenerationR
         claims.push_back({claim.text, Citation(document->source(),
             Chunk(chunk.documentId(), chunk.line(), claim.quote, chunk.page(), chunk.docx(), chunk.chunkId(), range))});
     }
-    return Answer(std::move(claims), result.fromCache);
+    return Answer(std::move(claims), result.fromCache, result.context);
 }
 
 }  // namespace
@@ -102,6 +102,11 @@ Result<CharacterRange> locateQuote(std::string_view block, const Citation& citat
 
 Result<ImportReport> IndexingService::import(const std::filesystem::path& path) {
     return store_.importSource(path, [this](const auto& copy) { return parse(copy); });
+}
+
+Result<ImportReport> IndexingService::update(DocumentId id, const std::filesystem::path &path,
+                                             std::stop_token stop) {
+    return store_.updateSource(id, path, [this](const auto &copy) { return parse(copy); }, stop);
 }
 
 Result<ParsedSource> IndexingService::parse(const std::filesystem::path& path) const {
@@ -199,6 +204,12 @@ Result<GenerationResult> ValidatingLlmProvider::generate(const GenerationRequest
     auto result = inner_.generate(sent);
     if (auto* generated = std::get_if<GenerationResult>(&result)) {
         generated->fromCache = false;
+        generated->context.emplace();
+        for (const auto &chunk : sent.evidence) {
+            if (std::ranges::find(*generated->context, chunk.documentId()) == generated->context->end())
+                generated->context->push_back(chunk.documentId());
+        }
+        std::ranges::sort(*generated->context);
         const auto answer = resolveAnswer(sent, *generated);
         if (const auto* error = std::get_if<AppError>(&answer)) {
             return *error;
@@ -267,7 +278,7 @@ Result<Answer> RagService::askWithProfile(const std::string& text, const Questio
         return answer;
     };
     if (documents.empty()) {
-        return complete(Answer{});
+        return complete(Answer({}, false, std::vector<DocumentId>{}));
     }
 
     const auto retrieved = retriever_.retrieve(query, library);
@@ -276,7 +287,7 @@ Result<Answer> RagService::askWithProfile(const std::string& text, const Questio
     }
     const auto& evidence = std::get<std::vector<Chunk>>(retrieved);
     if (evidence.empty()) {
-        return complete(Answer{});
+        return complete(Answer({}, false, std::vector<DocumentId>{}));
     }
 
     const GenerationRequest request{query, library.revision, profile, evidence, documents};

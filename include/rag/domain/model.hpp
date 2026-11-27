@@ -53,7 +53,8 @@ enum class AppError {
     RemoteTimeout,
     RemoteRefusal,
     RemoteIncomplete,
-    LibraryBusy
+    LibraryBusy,
+    Cancelled
 };
 
 template <typename T>
@@ -188,8 +189,10 @@ enum class AnswerStatus { Answered, InsufficientEvidence };
 class Answer {
 public:
     Answer() = default;
-    explicit Answer(std::vector<CitedClaim> claims, bool fromCache = false)
-        : claims_(std::move(claims)), fromCache_(fromCache) {}
+    explicit Answer(std::vector<CitedClaim> claims, bool fromCache = false,
+                    std::optional<std::vector<DocumentId>> context = {})
+        : claims_(std::move(claims)), fromCache_(fromCache), context_(std::move(context)) {}
+    const std::optional<std::vector<DocumentId>> &context() const noexcept { return context_; }
 
     AnswerStatus status() const noexcept {
         return claims_.empty() ? AnswerStatus::InsufficientEvidence : AnswerStatus::Answered;
@@ -200,6 +203,7 @@ public:
 private:
     std::vector<CitedClaim> claims_;
     bool fromCache_ = false;
+    std::optional<std::vector<DocumentId>> context_;
 };
 
 }  // namespace rag

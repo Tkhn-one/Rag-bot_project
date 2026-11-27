@@ -2,6 +2,7 @@
 #include "rag/infrastructure/utf8.hpp"
 #include "cache_key.hpp"
 #include "managed_source.hpp"
+#include "rag/infrastructure/local_path.hpp"
 #include "rag/application/services.hpp"
 #include "rag/infrastructure/block_slices.hpp"
 #include "sqlite_search.hpp"
@@ -14,7 +15,7 @@ namespace rag {
 namespace {
 
 constexpr int applicationId = 0x52414742;  // RAGB
-constexpr int schemaVersion = 10;
+constexpr int schemaVersion = 11;
 constexpr auto createV2Schema = R"sql(
     CREATE TABLE documents (
         id INTEGER PRIMARY KEY,
@@ -173,6 +174,33 @@ constexpr auto addManagedSources = R"sql(
     PRAGMA user_version=10;
 )sql";
 
+constexpr auto addDocumentLifecycle = R"sql(
+    CREATE TABLE documents_v11(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, content TEXT NOT NULL COLLATE BINARY,
+        policy INTEGER NOT NULL CHECK(policy IN (0,1)), position_layout TEXT NOT NULL,
+        sha256 TEXT CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+        since_revision INTEGER NOT NULL CHECK(since_revision>=0),
+        retired_revision INTEGER, family_id INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+    INSERT INTO documents_v11 SELECT id,source,content,policy,position_layout,sha256,since_revision,NULL,id FROM documents;
+    DROP TABLE documents;
+    ALTER TABLE documents_v11 RENAME TO documents;
+    CREATE UNIQUE INDEX active_digest ON documents(sha256) WHERE retired_revision IS NULL;
+    CREATE UNIQUE INDEX text_only_identity ON documents(content,position_layout)
+        WHERE sha256 IS NULL AND retired_revision IS NULL;
+    CREATE TABLE history_context(
+        owner_id INTEGER NOT NULL REFERENCES history(id) ON DELETE CASCADE,
+        document_id INTEGER NOT NULL CHECK(document_id>=0),
+        PRIMARY KEY(owner_id,document_id)
+    ) STRICT, WITHOUT ROWID;
+    CREATE TABLE cache_context(
+        owner_id INTEGER NOT NULL REFERENCES answer_cache(id) ON DELETE CASCADE,
+        document_id INTEGER NOT NULL CHECK(document_id>=0),
+        PRIMARY KEY(owner_id,document_id)
+    ) STRICT, WITHOUT ROWID;
+    PRAGMA user_version=11;
+)sql";
+
 struct Schema {
     int application;
     int version;
@@ -214,7 +242,7 @@ std::optional<AppError> initializeSchema(sqlite3* database) {
             !execute(database, addLibraryMetadata) || !execute(database, addCacheAndHistory) ||
             !execute(database, createSearchIndex) || !execute(database, addSourceBlocks) ||
             !execute(database, indexWholeTerms) || !execute(database, addStructuredAnswers) ||
-            !execute(database, addManagedSources)) {
+            !execute(database, addManagedSources) || !execute(database, addDocumentLifecycle)) {
             return databaseError(database, AppError::StoreWriteFailed);
         }
     }
@@ -335,7 +363,8 @@ std::optional<AppError> migrateLegacy(sqlite3* database, const std::filesystem::
             (schema->version <= 6 && !execute(database, addSourceBlocks)) ||
             (schema->version <= 7 && !execute(database, indexWholeTerms)) ||
             (schema->version <= 8 && !execute(database, addStructuredAnswers)) ||
-            !execute(database, addManagedSources) ||
+            (schema->version <= 9 && !execute(database, addManagedSources)) ||
+            !execute(database, addDocumentLifecycle) ||
             (schema->version >= 4 && schema->version <= 7 &&
              !execute(database, "UPDATE library SET revision = revision + 1 WHERE id=1"))) {
             return databaseError(database, AppError::StoreMigrationFailed);
@@ -391,7 +420,7 @@ Result<std::size_t> duplicateChunkCount(sqlite3* database, const std::string& co
                                         const std::string& positionLayout, const std::string& digest) {
     const auto query = prepare(database, R"sql(
         SELECT (SELECT count(*) FROM chunks WHERE document_id = documents.id)
-        FROM documents WHERE sha256 = ?3 OR (sha256 IS NULL AND ?3 = '' AND content = ?1 AND position_layout = ?2)
+        FROM documents WHERE retired_revision IS NULL AND (sha256 = ?3 OR (sha256 IS NULL AND ?3 = '' AND content = ?1 AND position_layout = ?2))
     )sql");
     if (!query || !bindText(query.get(), 1, content) || !bindText(query.get(), 2, positionLayout) || !bindText(query.get(), 3, digest) ||
         sqlite3_step(query.get()) != SQLITE_ROW) {
@@ -406,7 +435,7 @@ Result<std::size_t> duplicateChunkCount(sqlite3* database, const std::string& co
 
 bool advanceRevision(sqlite3* database) {
     return execute(database, "UPDATE library SET revision = revision + 1 WHERE id = 1") &&
-           sqlite3_changes(database) == 1 && execute(database, "DELETE FROM answer_cache");
+           sqlite3_changes(database) == 1;
 }
 
 Result<std::size_t> publishBlocks(sqlite3* database, std::optional<sqlite3_int64> document,
@@ -432,6 +461,10 @@ Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
     }
 
     const auto id = sqlite3_last_insert_rowid(database);
+    const auto family = prepare(database, "UPDATE documents SET family_id=id WHERE id=?1");
+    if (!family || sqlite3_bind_int64(family.get(), 1, id) != SQLITE_OK ||
+        sqlite3_step(family.get()) != SQLITE_DONE)
+        return AppError::StoreWriteFailed;
     const auto chunk = prepare(database, R"sql(
         INSERT INTO source_blocks (document_id, line, text, page, docx_part, docx_paragraph,
                             docx_table, docx_row, docx_cell)
@@ -455,6 +488,42 @@ Result<std::size_t> writeDocument(sqlite3* database, const std::string& source,
         return databaseError(database, AppError::StoreWriteFailed);
     }
     return published;
+}
+
+// A marker with document_id=0 distinguishes a known empty context from an old
+// answer that has no context metadata. Positive IDs are immutable version IDs.
+Result<bool> writeContext(sqlite3 *db, const char *sql, sqlite3_int64 owner,
+                          const std::optional<std::vector<DocumentId>> &documents) {
+    if (!documents) return true;
+    auto row = prepare(db, sql);
+    if (!row || sqlite3_bind_int64(row.get(), 1, owner) != SQLITE_OK ||
+        sqlite3_bind_int64(row.get(), 2, 0) != SQLITE_OK || sqlite3_step(row.get()) != SQLITE_DONE)
+        return AppError::StoreWriteFailed;
+    for (auto id : *documents) {
+        if (sqlite3_reset(row.get()) != SQLITE_OK || !bindPositionNumber(row.get(), 2, id) ||
+            sqlite3_step(row.get()) != SQLITE_DONE)
+            return AppError::StoreWriteFailed;
+    }
+    return true;
+}
+
+Result<std::optional<std::vector<DocumentId>>> readContext(sqlite3 *db, const char *sql,
+                                                           sqlite3_int64 owner) {
+    auto row = prepare(db, sql);
+    if (!row || sqlite3_bind_int64(row.get(), 1, owner) != SQLITE_OK) return AppError::StoreReadFailed;
+    std::optional<std::vector<DocumentId>> ids;
+    int status;
+    while ((status = sqlite3_step(row.get())) == SQLITE_ROW) {
+        const auto raw = sqlite3_column_int64(row.get(), 0);
+        if (raw == 0)
+            ids.emplace();
+        else if (!ids || raw < 0 || !std::in_range<DocumentId>(raw))
+            return AppError::StoreCorrupt;
+        else
+            ids->push_back(static_cast<DocumentId>(raw));
+    }
+    if (status != SQLITE_DONE) return AppError::StoreReadFailed;
+    return ids;
 }
 
 Result<bool> changePolicy(sqlite3* database, sqlite3_int64 id, DocumentPolicy policy,
@@ -532,9 +601,10 @@ Result<Chunk> readChunk(sqlite3_stmt* query, DocumentId id, std::size_t chunkId 
 
 Result<std::size_t> publishBlocks(sqlite3* db, std::optional<sqlite3_int64> document,
                                   const IEmbeddingProvider* embeddings) {
-    std::string select = "SELECT line,text,page,docx_part,docx_paragraph,docx_table,docx_row,docx_cell,document_id "
-                         "FROM source_blocks ";
-    if (document) select += "WHERE document_id=?1 ";
+    std::string select =
+        "SELECT line,text,page,docx_part,docx_paragraph,docx_table,docx_row,docx_cell,document_id "
+        "FROM source_blocks WHERE document_id IN (SELECT id FROM documents WHERE retired_revision IS NULL) ";
+    if (document) select += "AND document_id=?1 ";
     select += "ORDER BY document_id,line";
     auto rows = prepare(db, select.c_str());
     auto insert = prepare(db, R"sql(
@@ -672,7 +742,10 @@ Result<std::unique_ptr<SqliteKnowledgeStore>> SqliteKnowledgeStore::open(
     if (const auto error = checkIntegrity(raw)) {
         return *error;
     }
-    return std::unique_ptr<SqliteKnowledgeStore>(new SqliteKnowledgeStore(std::move(database)));
+    auto store = std::unique_ptr<SqliteKnowledgeStore>(new SqliteKnowledgeStore(std::move(database)));
+    // A committed removal can outlive a locked file; retry under the writer lock.
+    store->cleanupSources();
+    return store;
 }
 
 Result<std::unique_ptr<SqliteKnowledgeStore>> SqliteKnowledgeStore::openInMemory() {
@@ -717,9 +790,25 @@ Result<std::size_t> SqliteKnowledgeStore::save(std::string source, std::string c
 }
 
 Result<ImportReport> SqliteKnowledgeStore::importSource(const std::filesystem::path& path, const ParseSource& parse) {
+    return importManaged(path, parse, {});
+}
+
+Result<ImportReport> SqliteKnowledgeStore::updateSource(DocumentId id, const std::filesystem::path &path,
+                                                        const ParseSource &parse, std::stop_token stop) {
+    if (!id || !std::in_range<sqlite3_int64>(id)) return AppError::StoreWriteFailed;
+    return importManaged(path, parse, id, stop);
+}
+
+Result<ImportReport> SqliteKnowledgeStore::importManaged(const std::filesystem::path &path,
+                                                         const ParseSource &parse,
+                                                         std::optional<DocumentId> replace,
+                                                         std::stop_token stop) {
+    if (stop.stop_requested()) return AppError::Cancelled;
     auto* db = database_.get();
     const char* filename = sqlite3_db_filename(db, "main");
-    if (!filename || !*filename) return IKnowledgeStore::importSource(path, parse);
+    if (!filename || !*filename)
+        return replace ? Result<ImportReport>{AppError::StoreWriteFailed}
+                       : IKnowledgeStore::importSource(path, parse);
 
     WriteTransaction transaction(db);
     if (!transaction.started()) return databaseError(db, AppError::StoreWriteFailed);
@@ -734,25 +823,74 @@ Result<ImportReport> SqliteKnowledgeStore::importSource(const std::filesystem::p
     const auto copy = stage.copy(path, root);
     if (const auto* error = std::get_if<AppError>(&copy)) return *error;
     auto parsed = parse(stage.path());
+    if (stop.stop_requested()) return AppError::Cancelled;
     if (auto* error = std::get_if<AppError>(&parsed)) return *error;
     auto& source = std::get<ParsedSource>(parsed);
     const auto& digest = std::get<std::string>(copy);
+    sqlite3_int64 family = 0;
+    if (replace) {
+        auto current = prepare(
+            db, "SELECT family_id,sha256,source FROM documents WHERE id=?1 AND retired_revision IS NULL");
+        if (!current || !bindPositionNumber(current.get(), 1, *replace) ||
+            sqlite3_step(current.get()) != SQLITE_ROW)
+            return AppError::StoreWriteFailed;
+        family = sqlite3_column_int64(current.get(), 0);
+        if (readText(current.get(), 1) == digest) {
+            const auto count = duplicateChunkCount(db, source.content, source.layout, digest);
+            if (auto *error = std::get_if<AppError>(&count)) return *error;
+            auto target = root / digest;
+            const auto ext =
+                sourceExtension(decodeUtf8(readText(current.get(), 2).value_or("")).value_or(L""));
+            if (ext.empty()) return AppError::StoreCorrupt;
+            target += ext;
+            if (stop.stop_requested()) return AppError::Cancelled;
+            if (!verifiedCopy(target, digest) && !stage.publish(target)) return AppError::StoreWriteFailed;
+            if (!transaction.commit()) return databaseError(db, AppError::StoreWriteFailed);
+            source.report.chunks = std::get<std::size_t>(count);
+            source.report.documentId = *replace;
+            return std::move(source.report);
+        }
+        auto duplicate = prepare(db, "SELECT 1 FROM documents WHERE sha256=?1 AND retired_revision IS NULL");
+        if (!duplicate || !bindText(duplicate.get(), 1, digest)) return AppError::StoreWriteFailed;
+        if (sqlite3_step(duplicate.get()) != SQLITE_DONE) return AppError::StoreWriteFailed;
+        auto retire = prepare(
+            db,
+            "UPDATE documents SET retired_revision=(SELECT revision+1 FROM library),policy=0 WHERE id=?1");
+        auto fts = prepare(db, "DELETE FROM chunks_fts WHERE document_id=?1");
+        auto chunks = prepare(db, "DELETE FROM chunks WHERE document_id=?1");
+        for (auto *statement : {retire.get(), fts.get(), chunks.get()}) {
+            if (!statement || !bindPositionNumber(statement, 1, *replace) ||
+                sqlite3_step(statement) != SQLITE_DONE)
+                return AppError::StoreWriteFailed;
+        }
+    }
     const auto name = path.filename().u8string();
     const auto result = writeDocument(db, std::string(name.begin(), name.end()), source.content, source.lines,
                                       DocumentPolicy::LocalOnly, source.layout, embeddings_, digest);
     if (const auto* error = std::get_if<AppError>(&result)) return *error;
 
     // A duplicate keeps its first display name and format.
-    auto stored = prepare(db, "SELECT source FROM documents WHERE sha256=?1");
+    auto stored = prepare(db, "SELECT source,id FROM documents WHERE sha256=?1 AND retired_revision IS NULL");
     if (!stored || !bindText(stored.get(), 1, digest) || sqlite3_step(stored.get()) != SQLITE_ROW)
         return AppError::StoreReadFailed;
+    const auto id = readPositionNumber(stored.get(), 1);
+    if (!id) return AppError::StoreCorrupt;
+    if (replace) {
+        const auto group = prepare(db, "UPDATE documents SET family_id=?1 WHERE id=?2");
+        if (!group || sqlite3_bind_int64(group.get(), 1, family) != SQLITE_OK ||
+            !bindPositionNumber(group.get(), 2, *id) || sqlite3_step(group.get()) != SQLITE_DONE)
+            return AppError::StoreWriteFailed;
+    }
     const auto ext = sourceExtension(decodeUtf8(readText(stored.get(), 0).value_or("")).value_or(L""));
     if (ext.empty()) return AppError::StoreCorrupt;
     auto target = root / digest;
     target += ext;
+    if (stop.stop_requested()) return AppError::Cancelled;
     if (!verifiedCopy(target, digest) && !stage.publish(target)) return AppError::StoreWriteFailed;
+    if (stop.stop_requested()) return AppError::Cancelled;
     if (!transaction.commit()) return databaseError(db, AppError::StoreWriteFailed);
     source.report.chunks = std::get<std::size_t>(result);
+    source.report.documentId = *id;
     return std::move(source.report);
 }
 
@@ -762,7 +900,7 @@ Result<CitationSource> SqliteKnowledgeStore::resolveSource(const IndexRevision& 
         SELECT b.line,b.text,b.page,b.docx_part,b.docx_paragraph,b.docx_table,b.docx_row,b.docx_cell,
                d.sha256,d.source
         FROM source_blocks b JOIN documents d ON d.id=b.document_id CROSS JOIN library l
-        WHERE l.id=1 AND l.library_id=?1 AND d.id=?2 AND b.line=?3 AND ?4 BETWEEN d.since_revision AND l.revision
+        WHERE l.id=1 AND l.library_id=?1 AND d.id=?2 AND b.line=?3 AND ?4 BETWEEN d.since_revision AND l.revision AND (d.retired_revision IS NULL OR ?4<d.retired_revision)
     )sql");
     if (!std::in_range<sqlite3_int64>(revision.number) || !row ||
         !bindText(row.get(), 1, revision.libraryId) || !bindPositionNumber(row.get(), 2, citation.documentId()) ||
@@ -797,6 +935,136 @@ Result<CitationSource> SqliteKnowledgeStore::resolveSource(const IndexRevision& 
     return source;
 }
 
+namespace {
+constexpr auto unknownCountsSql = R"sql(
+    SELECT
+      (SELECT count(*) FROM history h WHERE NOT EXISTS(SELECT 1 FROM history_context c WHERE c.owner_id=h.id AND c.document_id=0)),
+      (SELECT count(*) FROM answer_cache a WHERE NOT EXISTS(SELECT 1 FROM cache_context c WHERE c.owner_id=a.id AND c.document_id=0))
+)sql";
+
+Result<ContextCounts> contextCounts(sqlite3 *db, const char *sql, std::optional<DocumentId> id = {}) {
+    auto row = prepare(db, sql);
+    if (!row || (id && !bindPositionNumber(row.get(), 1, *id)) || sqlite3_step(row.get()) != SQLITE_ROW)
+        return AppError::StoreReadFailed;
+    return ContextCounts{static_cast<std::size_t>(sqlite3_column_int64(row.get(), 0)),
+                         static_cast<std::size_t>(sqlite3_column_int64(row.get(), 1))};
+}
+} // namespace
+
+Result<DeletionPlan> SqliteKnowledgeStore::deletionPlan(DocumentId id) const {
+    auto *db = database_.get();
+    auto current = prepare(db, "SELECT family_id FROM documents WHERE id=?1 AND retired_revision IS NULL");
+    if (!current || !bindPositionNumber(current.get(), 1, id) || sqlite3_step(current.get()) != SQLITE_ROW)
+        return AppError::StoreReadFailed;
+    auto family = readPositionNumber(current.get(), 0);
+    if (!family) return AppError::StoreCorrupt;
+    const auto unknown = contextCounts(db, unknownCountsSql);
+    const auto linked = contextCounts(db, R"sql(
+        SELECT
+          (SELECT count(DISTINCT owner_id) FROM history_context WHERE document_id IN (SELECT id FROM documents WHERE family_id=?1)),
+          (SELECT count(DISTINCT owner_id) FROM cache_context WHERE document_id IN (SELECT id FROM documents WHERE family_id=?1))
+    )sql",
+                                      *family);
+    if (auto *error = std::get_if<AppError>(&unknown)) return *error;
+    if (auto *error = std::get_if<AppError>(&linked)) return *error;
+    return DeletionPlan{id, std::get<ContextCounts>(linked), std::get<ContextCounts>(unknown)};
+}
+
+Result<ContextCounts> SqliteKnowledgeStore::unknownContextCounts() const {
+    return contextCounts(database_.get(), unknownCountsSql);
+}
+
+Result<ContextCounts> SqliteKnowledgeStore::clearUnknownContext() {
+    auto *db = database_.get();
+    WriteTransaction transaction(db);
+    if (!transaction.started()) return databaseError(db, AppError::StoreWriteFailed);
+    auto count = contextCounts(db, unknownCountsSql);
+    if (auto *error = std::get_if<AppError>(&count)) return *error;
+    if (!execute(db, R"sql(
+        DELETE FROM history WHERE NOT EXISTS(SELECT 1 FROM history_context c WHERE c.owner_id=history.id AND c.document_id=0);
+        DELETE FROM answer_cache WHERE NOT EXISTS(SELECT 1 FROM cache_context c WHERE c.owner_id=answer_cache.id AND c.document_id=0);
+    )sql") ||
+        !transaction.commit())
+        return databaseError(db, AppError::StoreWriteFailed);
+    return count;
+}
+
+Result<DeletionReport> SqliteKnowledgeStore::deleteDocument(DocumentId id) {
+    auto *db = database_.get();
+    WriteTransaction transaction(db);
+    if (!transaction.started()) return databaseError(db, AppError::StoreWriteFailed);
+    auto preview = deletionPlan(id);
+    if (auto *error = std::get_if<AppError>(&preview)) return *error;
+    const auto &plan = std::get<DeletionPlan>(preview);
+    if (plan.unknown.history || plan.unknown.cache) return DeletionReport{false, plan.unknown, 0};
+    auto current = prepare(db, "SELECT family_id FROM documents WHERE id=?1 AND retired_revision IS NULL");
+    if (!current || !bindPositionNumber(current.get(), 1, id) || sqlite3_step(current.get()) != SQLITE_ROW)
+        return AppError::StoreReadFailed;
+    const auto family = sqlite3_column_int64(current.get(), 0);
+    current.reset();
+    for (auto sql :
+         {"DELETE FROM history WHERE id IN (SELECT owner_id FROM history_context WHERE document_id IN "
+          "(SELECT id FROM documents WHERE family_id=?1))",
+          "DELETE FROM answer_cache WHERE id IN (SELECT owner_id FROM cache_context WHERE document_id IN "
+          "(SELECT id FROM documents WHERE family_id=?1))",
+          "DELETE FROM chunks_fts WHERE document_id IN (SELECT id FROM documents WHERE family_id=?1)",
+          "DELETE FROM documents WHERE family_id=?1"}) {
+        auto row = prepare(db, sql);
+        if (!row || sqlite3_bind_int64(row.get(), 1, family) != SQLITE_OK ||
+            sqlite3_step(row.get()) != SQLITE_DONE)
+            return databaseError(db, AppError::StoreWriteFailed);
+    }
+    if (!advanceRevision(db) || !transaction.commit()) return databaseError(db, AppError::StoreWriteFailed);
+    const auto cleaned = cleanupSources();
+    return DeletionReport{
+        true, {}, std::holds_alternative<AppError>(cleaned) ? 1 : std::get<std::size_t>(cleaned)};
+}
+
+Result<std::size_t> SqliteKnowledgeStore::cleanupSources() {
+    auto *db = database_.get();
+    WriteTransaction transaction(db);
+    if (!transaction.started()) return databaseError(db, AppError::StoreWriteFailed);
+    auto meta = prepare(db, "SELECT library_id FROM library WHERE id=1");
+    if (!meta || sqlite3_step(meta.get()) != SQLITE_ROW) return AppError::StoreReadFailed;
+    auto root = sourceDirectory(db, readText(meta.get(), 0).value_or(""));
+    std::error_code ec;
+    if (root.empty() || !std::filesystem::exists(root, ec))
+        return ec ? Result<std::size_t>{AppError::StoreReadFailed} : Result<std::size_t>{std::size_t{0}};
+    if (!isLocalStoragePath(root)) return AppError::StoreWriteFailed;
+    auto refs = prepare(db, "SELECT source FROM documents WHERE sha256=?1");
+    if (!refs) return AppError::StoreReadFailed;
+    std::size_t pending = 0;
+    for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto path = it->path();
+        const auto extension = sourceExtension(path);
+        const auto utf8 = path.stem().u8string();
+        const std::string stem(utf8.begin(), utf8.end());
+        if (extension.empty()) continue;
+        const bool partial = stem.starts_with("partial-") && validDigest(std::string_view(stem).substr(8));
+        if (!partial && !validDigest(stem)) continue;
+        bool referenced = false;
+        if (!partial) {
+            if (sqlite3_reset(refs.get()) != SQLITE_OK || !bindText(refs.get(), 1, stem))
+                return AppError::StoreReadFailed;
+            int status;
+            while ((status = sqlite3_step(refs.get())) == SQLITE_ROW) {
+                if (sourceExtension(decodeUtf8(readText(refs.get(), 0).value_or("")).value_or(L"")) ==
+                    extension)
+                    referenced = true;
+            }
+            if (status != SQLITE_DONE) return AppError::StoreReadFailed;
+        }
+        if (referenced) continue;
+        std::error_code removal;
+        if (!isLocalStoragePath(path) || !std::filesystem::is_regular_file(path, removal) ||
+            !std::filesystem::remove(path, removal) || removal)
+            ++pending;
+    }
+    if (ec) return AppError::StoreWriteFailed;
+    if (!transaction.commit()) return AppError::StoreWriteFailed;
+    return pending;
+}
+
 Result<bool> SqliteKnowledgeStore::setLibraryPolicy(DocumentPolicy policy) {
     return changePolicy(database_.get(), 1, policy, "SELECT policy FROM library WHERE id = ?1",
                         "UPDATE library SET policy = ?2 WHERE id = ?1");
@@ -807,8 +1075,8 @@ Result<bool> SqliteKnowledgeStore::setDocumentPolicy(DocumentId id, DocumentPoli
         return AppError::StoreWriteFailed;
     }
     return changePolicy(database_.get(), static_cast<sqlite3_int64>(id), policy,
-                        "SELECT policy FROM documents WHERE id = ?1",
-                        "UPDATE documents SET policy = ?2 WHERE id = ?1");
+                        "SELECT policy FROM documents WHERE id = ?1 AND retired_revision IS NULL",
+                        "UPDATE documents SET policy = ?2 WHERE id = ?1 AND retired_revision IS NULL");
 }
 
 Result<Answer> SqliteKnowledgeStore::runRemoteQuestion(const RemoteQuestion& question) const {
@@ -848,8 +1116,8 @@ Result<LibrarySnapshot> SqliteKnowledgeStore::snapshot() const {
     LibrarySnapshot result{{std::move(*libraryId), static_cast<std::uint64_t>(number)},
                            libraryPolicy == 1 ? DocumentPolicy::AllowRemote : DocumentPolicy::LocalOnly, {}};
 
-    const auto documents = prepare(database,
-        "SELECT id, source, content, policy, position_layout FROM documents ORDER BY id");
+    const auto documents = prepare(database, "SELECT id, source, content, policy, position_layout FROM "
+                                             "documents WHERE retired_revision IS NULL ORDER BY id");
     const auto chunks = prepare(database, R"sql(
         SELECT coalesce(source_line,line), text, page, docx_part, docx_paragraph, docx_table, docx_row, docx_cell,
                line, first_char, last_char
@@ -922,8 +1190,14 @@ Result<std::optional<GenerationResult>> SqliteKnowledgeStore::lookup(const Gener
 
     const bool hasAnswer = sqlite3_column_int(stmt.get(), 1) != 0;
     if (hasAnswer != !answered.claims.empty()) return AppError::StoreCorrupt;
-    if (hasAnswer) return std::optional{GenerationResult{std::move(answered)}};
-    return std::optional{GenerationResult{}};
+    auto context =
+        readContext(db, "SELECT document_id FROM cache_context WHERE owner_id=?1 ORDER BY document_id",
+                    sqlite3_column_int64(stmt.get(), 0));
+    if (const auto *error = std::get_if<AppError>(&context)) return *error;
+    GenerationResult result;
+    if (hasAnswer) result.value = std::move(answered);
+    result.context = std::get<std::optional<std::vector<DocumentId>>>(std::move(context));
+    return std::optional{std::move(result)};
 }
 
 Result<bool> SqliteKnowledgeStore::remember(const GenerationRequest& request, const GenerationResult& result) {
@@ -947,6 +1221,11 @@ Result<bool> SqliteKnowledgeStore::remember(const GenerationRequest& request, co
         return databaseError(db, AppError::StoreWriteFailed);
     }
     const bool inserted = sqlite3_changes(db) != 0;
+    if (inserted) {
+        const auto context = writeContext(db, "INSERT INTO cache_context VALUES(?1,?2)",
+                                          sqlite3_last_insert_rowid(db), result.context);
+        if (const auto *error = std::get_if<AppError>(&context)) return *error;
+    }
     if (inserted && answered) {
         const auto rows = prepare(db, R"sql(
             INSERT INTO cached_claims (cache_id, ordinal, claim, document_id, chunk_id, quote)
@@ -993,6 +1272,17 @@ Result<bool> SqliteKnowledgeStore::appendHistory(const std::string& question, co
         sqlite3_step(row) != SQLITE_DONE) {
         return databaseError(db, AppError::StoreWriteFailed);
     }
+
+    {
+        auto current = prepare(db, "SELECT 1 FROM library WHERE id=1 AND library_id=?1 AND revision=?2");
+        if (!current || !bindText(current.get(), 1, revision.libraryId) ||
+            sqlite3_bind_int64(current.get(), 2, static_cast<sqlite3_int64>(revision.number)) != SQLITE_OK ||
+            sqlite3_step(current.get()) != SQLITE_ROW)
+            return AppError::LibraryBusy;
+    }
+    const auto context = writeContext(db, "INSERT INTO history_context VALUES(?1,?2)",
+                                      sqlite3_last_insert_rowid(db), answer.context());
+    if (const auto *error = std::get_if<AppError>(&context)) return *error;
 
     if (!answer.claims().empty()) {
         const auto rows = prepare(db, R"sql(
@@ -1071,11 +1361,19 @@ Result<std::vector<HistoryEntry>> SqliteKnowledgeStore::history() const {
         if (!time || !question || !library || revision < 0 || !model || !parameters || !format || !endpoint || !scope) {
             return AppError::StoreCorrupt;
         }
+        auto context =
+            readContext(db, "SELECT document_id FROM history_context WHERE owner_id=?1 ORDER BY document_id",
+                        sqlite3_column_int64(row, 0));
+        if (const auto *error = std::get_if<AppError>(&context)) return *error;
         const auto processing = sqlite3_column_int(row, 6) ? ProcessingType::Remote : ProcessingType::Local;
-        entries.push_back({std::move(*time), std::move(*question), {std::move(*library), static_cast<std::uint64_t>(revision)},
+        entries.push_back({std::move(*time),
+                           std::move(*question),
+                           {std::move(*library), static_cast<std::uint64_t>(revision)},
                            {processing, std::move(*model), std::move(*parameters), std::move(*format),
                             std::move(*endpoint), std::move(*scope)},
-                           Answer(std::move(claims), sqlite3_column_int(row, 1) != 0), sqlite3_column_int(row, 12) != 0});
+                           Answer(std::move(claims), sqlite3_column_int(row, 1) != 0,
+                                  std::get<std::optional<std::vector<DocumentId>>>(std::move(context))),
+                           sqlite3_column_int(row, 12) != 0});
     }
     if (status != SQLITE_DONE) return databaseError(db, AppError::StoreReadFailed);
     return entries;

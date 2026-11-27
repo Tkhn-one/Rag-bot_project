@@ -12,8 +12,9 @@ public:
         : reader_(reader), store_(store) {}
 
     Result<ImportReport> import(const std::filesystem::path& path);
+    Result<ImportReport> update(DocumentId id, const std::filesystem::path &path, std::stop_token stop = {});
 
-private:
+  private:
     Result<ParsedSource> parse(const std::filesystem::path& path) const;
     const IDocumentReader& reader_;
     IKnowledgeStore& store_;

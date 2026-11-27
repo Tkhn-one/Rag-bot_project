@@ -5,6 +5,9 @@
 #include "rag/infrastructure/utf8.hpp"
 
 #include <sqlite3.h>
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 #include <chrono>
 #include <fstream>
@@ -289,6 +292,8 @@ void migrateSources(const fs::path& directory, const fs::path& demo) {
     }
     executeFixtureSql(db, R"sql(
         PRAGMA foreign_keys=OFF;
+        DROP TABLE cache_context;
+        DROP TABLE history_context;
         CREATE TABLE old_documents (
             id INTEGER PRIMARY KEY, source TEXT NOT NULL, content TEXT NOT NULL COLLATE BINARY,
             policy INTEGER NOT NULL CHECK(policy IN (0,1)), position_layout TEXT NOT NULL,
@@ -476,7 +481,7 @@ void migrate(const fs::path& directory) {
     createLegacyLibrary(path);
     const auto backup = directory / "legacy.sqlite.v1-backup" / "library.sqlite";
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 10, "opened database must advance to v10");
+    require(fixtureScalar(path, "PRAGMA user_version") == 11, "opened database must advance to v11");
     require(fixtureScalar(backup, "PRAGMA user_version") == 1 &&
                 fixtureScalar(backup, "SELECT document_id FROM chunks WHERE line = 4") == 42,
             "backup must retain the v1 schema, document ID and line");
@@ -534,7 +539,7 @@ void migratePdfEra(const fs::path& directory) {
             (42, 1, 'Orion snapshot runs every Friday.', 2);
     )sql");
     const auto store = openStore(path);
-    require(fixtureScalar(path, "PRAGMA user_version") == 10, "v2 must advance to v10");
+    require(fixtureScalar(path, "PRAGMA user_version") == 11, "v2 must advance to v11");
     const auto backup = directory / "pdf-era.sqlite.v2-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 2 &&
                 fixtureScalar(backup, "SELECT page FROM chunks WHERE document_id = 42") == 2,
@@ -574,8 +579,10 @@ void migrateDocxEra(const fs::path& directory) {
     const auto store = openStore(path);
     const auto backup = directory / "docx-era.sqlite.v3-backup" / "library.sqlite";
     require(fixtureScalar(backup, "PRAGMA user_version") == 3 &&
-                fixtureScalar(backup, "SELECT docx_row FROM chunks WHERE document_id = 17 AND line = 2") == 2 &&
-                fixtureScalar(path, "PRAGMA user_version") == 10, "migration must preserve a readable v3 backup");
+                fixtureScalar(backup, "SELECT docx_row FROM chunks WHERE document_id = 17 AND line = 2") ==
+                    2 &&
+                fixtureScalar(path, "PRAGMA user_version") == 11,
+            "migration must preserve a readable v3 backup");
     const auto snapshot = requireValue(store->snapshot(), "reading migrated v3 library");
     require(snapshot.revision.number == 0 && snapshot.policy == DocumentPolicy::LocalOnly &&
                 snapshot.documents.size() == 1, "migration starts a closed library at its baseline revision");
@@ -623,6 +630,8 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int ver
     }
     // Reconstruct the previous answer tables before applying the older search-schema fixtures.
     executeFixtureSql(path, R"sql(
+        DROP TABLE cache_context;
+        DROP TABLE history_context;
         CREATE TABLE old_answer_cache AS
             SELECT a.key, c.document_id, c.chunk_id AS line
             FROM answer_cache a JOIN cached_claims c ON c.cache_id = a.id;
@@ -656,8 +665,9 @@ void migrateRevisionEra(const fs::path& directory, const fs::path& demo, int ver
     if (version < 8) ++previous.number;  // Pre-v8 search formats publish a new index revision.
     require(fixtureScalar(backup, "PRAGMA user_version") == version &&
                 fixtureScalar(backup, "SELECT count(*) FROM documents") == 1 &&
-                fixtureScalar(path, "PRAGMA user_version") == 10 &&
-                fixtureScalar(path, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'копирование'") == 1 &&
+                fixtureScalar(path, "PRAGMA user_version") == 11 &&
+                fixtureScalar(path, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'копирование'") ==
+                    1 &&
                 requireValue(migrated->snapshot(), "reading the migrated revision").revision == previous,
             "migration must back up the database, populate FTS and publish a new revision");
     const auto history = requireValue(migrated->history(), "checking migrated history");
@@ -697,11 +707,15 @@ class CountingProvider final : public ILlmProvider {
 public:
     ModelProfile configured{ProcessingType::Local, "probe"};
     int calls = 0;
+    std::size_t contextLimit = 0;
     bool invalidChunk = false;
     bool fail = false;
     std::string lastQuestion;
 
     ModelProfile profile() const override { return configured; }
+    Result<std::size_t> evidenceCount(const GenerationRequest &request) const override {
+        return contextLimit ? std::min(contextLimit, request.evidence.size()) : request.evidence.size();
+    }
     Result<GenerationResult> generate(const GenerationRequest& request) override {
         ++calls;
         lastQuestion = request.question.text();
@@ -712,6 +726,177 @@ public:
         return GenerationResult{Answered{{{quote, invalidChunk ? "c999" : "c1", quote}}}};
     }
 };
+
+class FixtureEmbeddings final : public IEmbeddingProvider {
+  public:
+    std::string id = "fixture-v1";
+    bool fail = false;
+    std::string profileId() const override { return id; }
+    std::size_t dimension() const override { return 2; }
+    Result<std::size_t> documentTokenCount(std::string_view text) const override { return text.size(); }
+    Result<std::vector<float>> embed(std::string_view text, EmbeddingInput input) const override {
+        if (input == EmbeddingInput::Document && text.size() > 400) return AppError::EmbeddingFailed;
+        if (text.ends_with("TailMarker")) return std::vector<float>{1, 0};
+        if (fail && text == "Archive") return AppError::EmbeddingFailed;
+        if (text == "Archive" || text == "restore point") return std::vector<float>{3, 0};
+        if (text == "needle" || text.ends_with(" C")) return std::vector<float>{1, 0};
+        if (text.ends_with(" B")) return std::vector<float>{9, 1};
+        if (text.ends_with(" D")) return std::vector<float>{6, 4};
+        return std::vector<float>{0, 5};
+    }
+};
+
+void documentLifecycle(const fs::path &directory) {
+    const auto db = directory / "lifecycle.sqlite";
+    const auto a = directory / "alpha.txt";
+    const auto b = directory / "beta.txt";
+    const auto replacement = directory / "replacement.txt";
+    writeFixture(a, "Shared Alpha");
+    writeFixture(b, "Shared Beta");
+    writeFixture(replacement, "Changed Zeta");
+    auto store = openStore(db);
+    FixtureEmbeddings model;
+    requireValue(store->configureSearch(&model), "use hybrid index for lifecycle");
+    const TxtReader reader;
+    IndexingService indexing(reader, *store);
+    auto alpha = requireValue(indexing.import(a), "import alpha").documentId;
+    auto beta = requireValue(indexing.import(b), "import beta").documentId;
+    requireValue(store->setDocumentPolicy(beta, DocumentPolicy::AllowRemote), "allow beta");
+    class ContextRetriever final : public IRetriever {
+      public:
+        Result<std::vector<Chunk>> retrieve(const Question &question,
+                                            const LibrarySnapshot &library) const override {
+            std::vector<Chunk> result;
+            for (const auto &doc : library.documents) {
+                if (question.text() == "alpha" && doc.source() != "alpha.txt") continue;
+                result.push_back(doc.chunks().front());
+            }
+            return result;
+        }
+    } retriever;
+    CountingProvider probe;
+    ValidatingLlmProvider validated(probe);
+    CachingLlmProvider cached(validated, *store);
+    RagService service(*store, retriever, cached, store.get());
+    const auto both = requireValue(service.ask("both"), "both documents passed");
+    require(firstCitation(both)->documentId() == alpha &&
+                both.context() == std::vector<DocumentId>{alpha, beta},
+            "non-cited document must be retained in context");
+    require(requireValue(service.ask("both"), "cached both").context() == both.context(),
+            "cache keeps full context");
+    requireValue(service.ask("alpha"), "unrelated answer");
+    probe.contextLimit = 1;
+    const auto limited = requireValue(service.ask("budget limited"), "limit to one document");
+    require(limited.context() == std::vector<DocumentId>{alpha}, "only submitted prefix belongs to context");
+    probe.contextLimit = 0;
+    const auto previous = requireValue(store->snapshot(), "before update");
+    const auto old = Citation(previous.documents.back().source(), previous.documents.back().chunks().front());
+    const auto oldSource = requireValue(store->resolveSource(previous.revision, old), "beta original source");
+    std::stop_source cancelled;
+    cancelled.request_stop();
+    requireError(indexing.update(beta, replacement, cancelled.get_token()), AppError::Cancelled,
+                 "cancel before update");
+    std::stop_source duringRead;
+    class CancelReader final : public IDocumentReader {
+      public:
+        explicit CancelReader(std::stop_source &source) : source_(source) {}
+        Result<ExtractedDocument> read(const fs::path &path) const override {
+            auto parsed = TxtReader{}.read(path);
+            source_.request_stop();
+            return parsed;
+        }
+
+      private:
+        std::stop_source &source_;
+    } cancelReader(duringRead);
+    requireError(IndexingService(cancelReader, *store).update(beta, replacement, duringRead.get_token()),
+                 AppError::Cancelled, "cancel after parsing snapshot");
+    executeFixtureSql(
+        db, "CREATE TRIGGER fail_update BEFORE INSERT ON chunks BEGIN SELECT RAISE(ABORT,'fail'); END;");
+    requireError(indexing.update(beta, replacement), AppError::StoreWriteFailed,
+                 "update transaction rollback");
+    executeFixtureSql(db, "DROP TRIGGER fail_update");
+    require(requireValue(store->snapshot(), "after failed update").revision == previous.revision,
+            "failed update leaves revision");
+    // A deferred foreign key fails at COMMIT, after the file has been published.
+    executeFixtureSql(db, R"sql(
+        CREATE TABLE commit_guard(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES documents(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER fail_publication AFTER UPDATE OF revision ON library
+        BEGIN INSERT INTO commit_guard VALUES(1,99999); END;
+    )sql");
+    requireError(indexing.update(beta, replacement), AppError::StoreWriteFailed,
+                 "failure after copy publication");
+    require(requireValue(store->snapshot(), "after failed commit").revision == previous.revision,
+            "rollback failed commit");
+    executeFixtureSql(db, "DROP TRIGGER fail_publication; DROP TABLE commit_guard;");
+    auto secondConnection = openStore(db);
+    std::size_t copyCount = 0;
+    for (const auto &item : fs::recursive_directory_iterator(directory / "sources")) {
+        if (item.is_regular_file()) ++copyCount;
+    }
+    require(copyCount == 2, "reopen removes orphan from failed commit");
+    secondConnection.reset();
+    auto updated = requireValue(indexing.update(beta, replacement), "successful update").documentId;
+    auto snapshot = requireValue(store->snapshot(), "new revision");
+    require(snapshot.revision.number == previous.revision.number + 1 && snapshot.documents.size() == 2 &&
+                snapshot.documents.back().id() == updated && updated != beta &&
+                snapshot.documents.back().policy() == DocumentPolicy::LocalOnly,
+            "new isolated version");
+    require(requireValue(store->resolveSource(previous.revision, old), "historical citation").copyPath ==
+                oldSource.copyPath,
+            "old citation resolves after update");
+    requireError(store->resolveSource(snapshot.revision, old), AppError::InvalidCitation,
+                 "retired citation not current");
+    require(!requireValue(service.ask("both"), "old cache invalidated").fromCache(), "revision invalidation");
+    require(fixtureScalar(db, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'Beta'") == 0 &&
+                fixtureScalar(db, "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'Zeta'") == 1,
+            "index only active version");
+    require(fixtureScalar(db, "SELECT count(*) FROM embeddings") == 2 &&
+                fixtureScalar(db, "SELECT count(*) FROM embeddings WHERE document_id=2") == 0,
+            "retired vectors removed");
+
+    // Reproduce the unknown-context records inherited from v0.5, including a cache-only record.
+    executeFixtureSql(
+        db, "DELETE FROM history_context WHERE owner_id=1; DELETE FROM cache_context WHERE owner_id=1;");
+    auto blocked = requireValue(store->deleteDocument(updated), "blocked removal");
+    require(!blocked.removed && blocked.unknown == ContextCounts{1, 1},
+            "block before clearing unknown context");
+    require(requireValue(store->snapshot(), "blocked snapshot").revision == snapshot.revision &&
+                requireValue(store->history(), "history not touched").size() == 5,
+            "block is non-destructive");
+    require(requireValue(store->clearUnknownContext(), "clear only unknown") == ContextCounts{1, 1},
+            "separate cleanup");
+    auto plan = requireValue(store->deletionPlan(updated), "known linked records");
+    require(plan.unknown == ContextCounts{} && plan.linked == ContextCounts{2, 1},
+            "linked cache and history include uncited beta");
+    // Keep the retired file open without FILE_SHARE_DELETE, then release and reopen.
+    const HANDLE locked = CreateFileW(oldSource.copyPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    require(locked != INVALID_HANDLE_VALUE, "lock managed source");
+    const auto deletion = store->deleteDocument(updated);
+    CloseHandle(locked);
+    const auto removed = requireValue(deletion, "delete logical document");
+    require(removed.removed && removed.pendingCopies == 1, "locked file pending retry");
+    secondConnection = openStore(db);
+    require(!fs::exists(oldSource.copyPath), "retry cleanup on reopen");
+    secondConnection.reset();
+    auto remaining = requireValue(store->snapshot(), "after removal");
+    require(remaining.documents.size() == 1 && remaining.documents[0].id() == alpha &&
+                remaining.revision.number == snapshot.revision.number + 1,
+            "remove only selected family");
+    require(!fs::exists(oldSource.copyPath), "remove previous binary version");
+    requireError(store->resolveSource(previous.revision, old), AppError::InvalidCitation,
+                 "no deleted source");
+    require(requireValue(store->history(), "unrelated history").size() == 2 &&
+                fixtureScalar(db, "SELECT count(*) FROM answer_cache") == 2,
+            "unrelated records survive");
+    require(fixtureScalar(db, "SELECT count(*) FROM documents") == 1, "no archived document remains");
+    require(fixtureScalar(db, "SELECT count(*) FROM embeddings") == 1, "only unrelated vectors survive");
+    requireError(store->appendHistory("late completion", previous.revision, probe.profile(), both),
+                 AppError::LibraryBusy, "a late answer cannot restore removed context");
+    auto reimport = requireValue(indexing.import(b), "reimport deleted bytes").documentId;
+    require(reimport > updated, "document version IDs must never be reused");
+}
 
 void cacheAndHistory(const fs::path& directory) {
     const auto path = directory / "answers.sqlite";
@@ -831,25 +1016,6 @@ void cacheAccessAndFailures(const fs::path& directory) {
                 requireValue(service.ask("Orion"), "reading corrected citation").fromCache() &&
                 probe.calls == 4 && cache.writes == 1, "only a validated retry may populate the cache");
 }
-
-class FixtureEmbeddings final : public IEmbeddingProvider {
-public:
-    std::string id = "fixture-v1";
-    bool fail = false;
-    std::string profileId() const override { return id; }
-    std::size_t dimension() const override { return 2; }
-    Result<std::size_t> documentTokenCount(std::string_view text) const override { return text.size(); }
-    Result<std::vector<float>> embed(std::string_view text, EmbeddingInput input) const override {
-        if (input == EmbeddingInput::Document && text.size() > 400) return AppError::EmbeddingFailed;
-        if (text.ends_with("TailMarker")) return std::vector<float>{1, 0};
-        if (fail && text == "Archive") return AppError::EmbeddingFailed;
-        if (text == "Archive" || text == "restore point") return std::vector<float>{3, 0};
-        if (text == "needle" || text.ends_with(" C")) return std::vector<float>{1, 0};
-        if (text.ends_with(" B")) return std::vector<float>{9, 1};
-        if (text.ends_with(" D")) return std::vector<float>{6, 4};
-        return std::vector<float>{0, 5};
-    }
-};
 
 void longBlocks(const fs::path& directory, const IEmbeddingProvider& model) {
     const auto path = directory / "long.sqlite";
@@ -1107,6 +1273,8 @@ int wmain(int argc, wchar_t* argv[]) {
             managedSources(directory.path(), argv[2]);
         } else if (test == L"migration_v9") {
             migrateSources(directory.path(), argv[2]);
+        } else if (test == L"document_lifecycle") {
+            documentLifecycle(directory.path());
         } else if (test == L"duplicate") {
             duplicate(directory.path(), argv[2]);
         } else if (test == L"rollback") {

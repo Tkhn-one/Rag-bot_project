@@ -15,6 +15,12 @@ public:
     static Result<std::unique_ptr<SqliteKnowledgeStore>> openInMemory();
 
     Result<ImportReport> importSource(const std::filesystem::path& path, const ParseSource& parse) override;
+    Result<ImportReport> updateSource(DocumentId id, const std::filesystem::path &path,
+                                      const ParseSource &parse, std::stop_token stop = {}) override;
+    Result<DeletionPlan> deletionPlan(DocumentId id) const override;
+    Result<DeletionReport> deleteDocument(DocumentId id) override;
+    Result<ContextCounts> unknownContextCounts() const override;
+    Result<ContextCounts> clearUnknownContext() override;
     Result<CitationSource> resolveSource(const IndexRevision& revision, const Citation& citation) const override;
     Result<std::size_t> save(std::string source, std::string content,
                              std::vector<DocumentLine> lines, DocumentPolicy policy,
@@ -41,6 +47,9 @@ private:
 
     explicit SqliteKnowledgeStore(Database database) : database_(std::move(database)) {}
 
+    Result<ImportReport> importManaged(const std::filesystem::path &path, const ParseSource &parse,
+                                       std::optional<DocumentId> replace, std::stop_token stop = {});
+    Result<std::size_t> cleanupSources();
     Database database_;
     const IEmbeddingProvider* embeddings_ = nullptr;
     SearchSettings settings_;

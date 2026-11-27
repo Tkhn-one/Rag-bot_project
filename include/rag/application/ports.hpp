@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <functional>
 #include <span>
+#include <stop_token>
 #include <string_view>
 #include <vector>
 
@@ -71,6 +72,7 @@ struct ImportReport {
     std::size_t chunks;
     std::vector<std::size_t> pagesWithoutText;
     bool incomplete;
+    DocumentId documentId = 0;
 };
 
 struct ParsedSource {
@@ -96,6 +98,24 @@ public:
     virtual Result<CitationSource> resolveSource(const IndexRevision& revision, const Citation& citation) const = 0;
 };
 
+struct ContextCounts {
+    std::size_t history = 0;
+    std::size_t cache = 0;
+    bool operator==(const ContextCounts &) const = default;
+};
+
+struct DeletionPlan {
+    DocumentId id;
+    ContextCounts linked;
+    ContextCounts unknown;
+};
+
+struct DeletionReport {
+    bool removed = false;
+    ContextCounts unknown;
+    std::size_t pendingCopies = 0;
+};
+
 class IKnowledgeStore {
 public:
     using RemoteQuestion = std::function<Result<Answer>()>;
@@ -104,6 +124,14 @@ public:
 
     using ParseSource = std::function<Result<ParsedSource>(const std::filesystem::path&)>;
     virtual Result<ImportReport> importSource(const std::filesystem::path& path, const ParseSource& parse);
+    virtual Result<ImportReport> updateSource(DocumentId, const std::filesystem::path &, const ParseSource &,
+                                              std::stop_token = {}) {
+        return AppError::StoreWriteFailed;
+    }
+    virtual Result<DeletionPlan> deletionPlan(DocumentId) const { return AppError::StoreReadFailed; }
+    virtual Result<DeletionReport> deleteDocument(DocumentId) { return AppError::StoreWriteFailed; }
+    virtual Result<ContextCounts> unknownContextCounts() const { return AppError::StoreReadFailed; }
+    virtual Result<ContextCounts> clearUnknownContext() { return AppError::StoreWriteFailed; }
 
     // Publish the document and its lines together. Line numbers must be positive and unique.
     // Position layout is empty for TXT. For equal text and layout, return the existing chunk count.
@@ -162,6 +190,8 @@ struct InsufficientEvidence {};
 struct GenerationResult {
     std::variant<InsufficientEvidence, Answered> value;
     bool fromCache = false;
+    // A disengaged optional denotes an old record whose full context is unknown.
+    std::optional<std::vector<DocumentId>> context;
 };
 
 // IDs belong to one ordered request. They reveal no source metadata.

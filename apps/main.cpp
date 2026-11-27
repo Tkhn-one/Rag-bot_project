@@ -60,18 +60,23 @@ void print(DWORD handleId, std::ostream& stream, const std::string& utf8) {
 }
 
 int usage() {
-    print(STD_ERROR_HANDLE, std::cerr,
-          "Использование: rag_cli <файл.txt|pdf|docx> [<ещё-файл> ...] \"<вопрос>\"\n"
-          "               rag_cli --db <база> [--embedding-model <GGUF>] [<файл> ...] \"<вопрос>\"\n"
-          "               rag_cli --db <база> [--embedding-model <GGUF>] --local-model <GGUF> [<файл> ...] \"<вопрос>\"\n"
-          "               rag_cli --db <база> [--embedding-model <GGUF>] --openai\n"
-          "                       [--model <ID>] [--dev-env-key] [--credential-scope <метка>] \"<вопрос>\"\n"
-          "               rag_cli --documents <база>\n"
-          "               rag_cli --policy <база> library|document <ID для document> allow-remote|local-only\n"
-          "               rag_cli --source <база> <номер записи истории> <номер цитаты>\n"
-          "               rag_cli --history <база>\n"
-          "               rag_cli --clear-history <база>\n"
-          "               rag_cli --reindex <база> [--embedding-model <GGUF>]\n");
+    print(
+        STD_ERROR_HANDLE, std::cerr,
+        "Использование: rag_cli <файл.txt|pdf|docx> [<ещё-файл> ...] \"<вопрос>\"\n"
+        "               rag_cli --db <база> [--embedding-model <GGUF>] [<файл> ...] \"<вопрос>\"\n"
+        "               rag_cli --db <база> [--embedding-model <GGUF>] --local-model <GGUF> [<файл> ...] "
+        "\"<вопрос>\"\n"
+        "               rag_cli --db <база> [--embedding-model <GGUF>] --openai\n"
+        "                       [--model <ID>] [--dev-env-key] [--credential-scope <метка>] \"<вопрос>\"\n"
+        "               rag_cli --documents <база>\n"
+        "               rag_cli --policy <база> library|document <ID для document> allow-remote|local-only\n"
+        "               rag_cli --update <база> <ID> [--embedding-model <GGUF>] <файл>\n"
+        "               rag_cli --delete <база> <ID> [--confirm]\n"
+        "               rag_cli --clear-unknown <база> [--confirm]\n"
+        "               rag_cli --source <база> <номер записи истории> <номер цитаты>\n"
+        "               rag_cli --history <база>\n"
+        "               rag_cli --clear-history <база>\n"
+        "               rag_cli --reindex <база> [--embedding-model <GGUF>]\n");
     return 2;
 }
 
@@ -99,6 +104,85 @@ std::optional<std::string> parseProfileLabel(std::wstring_view value) {
 
 int wmain(int argc, wchar_t* argv[]) {
     const auto command = argc > 1 ? std::wstring_view(argv[1]) : std::wstring_view{};
+    if (command == L"--update" || command == L"--delete" || command == L"--clear-unknown") {
+        const bool update = command == L"--update";
+        const bool remove = command == L"--delete";
+        if ((update && argc != 5 && argc != 7) || (remove && argc != 4 && argc != 5) ||
+            (!update && !remove && argc != 3 && argc != 4))
+            return usage();
+        if (!rag::isLocalStoragePath(argv[2])) return usage();
+        const auto id = (update || remove) ? parseDocumentId(argv[3]) : std::optional<rag::DocumentId>{};
+        if ((update || remove) && !id) return usage();
+        const bool confirm = !update && std::wstring_view(argv[argc - 1]) == L"--confirm";
+        if ((remove && argc == 5 && !confirm) || (!update && !remove && argc == 4 && !confirm))
+            return usage();
+        if (update && argc == 7 && std::wstring_view(argv[4]) != L"--embedding-model") return usage();
+        auto opened = rag::SqliteKnowledgeStore::open(argv[2], false);
+        auto reportError = [&](rag::AppError error) {
+            print(STD_ERROR_HANDLE, std::cerr, std::string(rag::describeError(error)) + "\n");
+            return 1;
+        };
+        if (const auto *error = std::get_if<rag::AppError>(&opened)) return reportError(*error);
+        auto &store = *std::get<std::unique_ptr<rag::SqliteKnowledgeStore>>(opened);
+        if (update) {
+            std::unique_ptr<rag::IEmbeddingProvider> embeddings;
+            if (argc == 7) {
+                auto model = rag::openLocalEmbeddings(argv[5]);
+                if (auto *error = std::get_if<rag::AppError>(&model)) return reportError(*error);
+                embeddings = std::get<std::unique_ptr<rag::IEmbeddingProvider>>(std::move(model));
+            }
+            auto configured = store.configureSearch(embeddings.get());
+            if (auto *error = std::get_if<rag::AppError>(&configured)) return reportError(*error);
+            const DocumentReader reader;
+            auto result = rag::IndexingService(reader, store).update(*id, argv[argc - 1]);
+            if (auto *error = std::get_if<rag::AppError>(&result)) return reportError(*error);
+            print(STD_OUTPUT_HANDLE, std::cout,
+                  "Активный ID документа: " + std::to_string(std::get<rag::ImportReport>(result).documentId) +
+                      "\n");
+            return 0;
+        }
+        auto countsText = [](const rag::ContextCounts &counts) {
+            return "история: " + std::to_string(counts.history) + ", кэш: " + std::to_string(counts.cache) +
+                   "\n";
+        };
+        if (!remove) {
+            auto counts = confirm ? store.clearUnknownContext() : store.unknownContextCounts();
+            if (auto *error = std::get_if<rag::AppError>(&counts)) return reportError(*error);
+            print(STD_OUTPUT_HANDLE, std::cout,
+                  (confirm ? "Удалены старые записи — " : "Записи с неизвестным контекстом — ") +
+                      countsText(std::get<rag::ContextCounts>(counts)));
+            if (!confirm) print(STD_OUTPUT_HANDLE, std::cout, "Для отдельной очистки добавьте --confirm.\n");
+            return 0;
+        }
+        auto preview = store.deletionPlan(*id);
+        if (auto *error = std::get_if<rag::AppError>(&preview)) return reportError(*error);
+        const auto &plan = std::get<rag::DeletionPlan>(preview);
+        if (plan.unknown.history || plan.unknown.cache) {
+            print(STD_ERROR_HANDLE, std::cerr,
+                  "Удаление заблокировано: неизвестный контекст — " + countsText(plan.unknown) +
+                      "Выполните отдельную очистку --clear-unknown.\n");
+            return 1;
+        }
+        print(STD_OUTPUT_HANDLE, std::cout,
+              "Будут удалены все версии документа и связанные записи — " + countsText(plan.linked));
+        if (!confirm) {
+            print(STD_OUTPUT_HANDLE, std::cout, "Для удаления добавьте --confirm.\n");
+            return 0;
+        }
+        auto result = store.deleteDocument(*id);
+        if (auto *error = std::get_if<rag::AppError>(&result)) return reportError(*error);
+        const auto &removed = std::get<rag::DeletionReport>(result);
+        if (!removed.removed) {
+            print(STD_ERROR_HANDLE, std::cerr,
+                  "Удаление заблокировано: неизвестный контекст — " + countsText(removed.unknown));
+            return 1;
+        }
+        print(STD_OUTPUT_HANDLE, std::cout, "Документ удалён.\n");
+        if (removed.pendingCopies)
+            print(STD_ERROR_HANDLE, std::cerr,
+                  "Некоторые копии недоступны для удаления; очистка будет повторена при открытии базы.\n");
+        return 0;
+    }
     if (command == L"--source") {
         if (argc != 5) return usage();
         const auto entry = parseDocumentId(argv[3]);
